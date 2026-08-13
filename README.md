@@ -52,6 +52,25 @@ bytes, 105 distinct characters — a 3-layer, width-96, context-64 model of
   300 steps in 187.0 s, 1780 tokens/s
 ```
 
+Sampling at temperature 0.8 after those 300 steps:
+
+```
+#dibes Nl Nize_o et);        ept thand ig tear = cens d ourwer s te sur/
+ssemels ctelonthe the be in nf ye hera t ans t alo t capr ifemarg onamemrcrall
+thamuan        * = izent = cononor & conde ang
+```
+
+Gibberish, but structured gibberish, and the structure is the evidence. It opens
+with `#` like a preprocessor directive, places `);`, `*` and `&` plausibly,
+produces `= cens` and `= izent` assignment shapes, reproduces the source's
+eight-space indentation runs, and spells real English words from the comments —
+`the`, `be`, `in`, `and`. Nothing above the character and short-word level, which
+is what 300 steps on a 362K-parameter model buys.
+
+For scale, 2.74 nats is about 3.95 bits per character; a well-trained character
+model on English runs nearer 1 to 1.5. The loss was still falling when the run
+stopped.
+
 The first loss lands on `ln(vocab_size)` to three decimal places, which is where
 an untrained model has to start: uniform over the vocabulary. Printing the
 expected value next to it turns the first step into a check on the
@@ -230,6 +249,13 @@ leaves each one overlapping its training neighbours by up to `block_size - 1`
 characters, which leaks the answer: validation then tracks training no matter how
 badly the model overfits, and the metric that exists to detect memorisation is
 the one memorisation defeats. The last 10% is held out as a single block.
+
+**Training is deterministic.** Two runs of the same command produce identical
+losses at every step, bit for bit — the initialisation is a seeded xorshift and
+the batch sampler is seeded too, with nothing reading the clock or the host's
+`rand()`. That matters for what comes next: a regression introduced while
+optimising the matmul shows up as a changed loss curve rather than disappearing
+into run-to-run noise.
 
 **The corpus is the repository itself.** Its own source, tests and prose,
 concatenated by a Makefile target. No download, fully reproducible, and C gives a

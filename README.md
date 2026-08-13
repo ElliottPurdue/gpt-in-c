@@ -86,6 +86,15 @@ which is overfitting beginning, and expected with 362K parameters against 132K
 training tokens. It is visible only because the validation split is contiguous;
 see below.
 
+### The 32-bit toolchain is costing about 1.8x
+
+CI reports **4,568 tokens/s** on a GitHub runner against **2,534** on the
+development machine, on identical code. The runner is x86-64 with GCC 13; the
+local build is 32-bit MinGW 6.3, which has half the registers, an older
+optimiser, and no pthread -- which is also why OpenMP is unavailable here. The
+matmul work below is measured on the slower of the two, so the figures are
+conservative rather than flattering.
+
 ### Making it faster, and proving it still computes the same thing
 
 The naive matmul was the entire cost. Restructuring it is worth **1.42x** on the
@@ -139,6 +148,11 @@ here is 32-bit MinGW 6.3.0 without one. Single-threaded gains transfer to the
 microcontroller targets anyway, where there are no threads to use.
 
 ## Verification
+
+CI runs the suite, the mutation pass, and a short training run on every push,
+on a different toolchain from the one used to develop it -- x86-64 GCC 13 rather
+than 32-bit MinGW 6.3. Everything below therefore holds on two compilers and two
+word sizes, not one.
 
 Every operation is compared against PyTorch at absolute 1e-5 or relative 1e-4,
 either sufficing. Both sides are float32 and accumulate in different orders, so
@@ -340,6 +354,14 @@ checked on load, since a checkpoint from a different shape is otherwise just
 bytes of the right length. The parameters themselves are one contiguous block by
 construction, so writing them is a single `fwrite` and no serialiser needs to
 know the model's structure.
+
+**The CI log is read with `errors="replace"`.** It embeds the generated sample,
+which is raw bytes the model emits in arbitrary order — including fragments of
+the multi-byte UTF-8 sequences in the corpus. That is not valid UTF-8, so a
+strict read raises `UnicodeDecodeError` on Linux while succeeding on Windows,
+whose default codec accepts any byte. Four assertions failed on that decode
+rather than on the property each claimed to check, which is the same shape of
+error as a test that passes for the wrong reason.
 
 **No file I/O in `src/`.** The library has no stdio dependency, so the same
 objects compile for a freestanding target. Loading oracle dumps lives in

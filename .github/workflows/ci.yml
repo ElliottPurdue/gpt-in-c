@@ -111,6 +111,20 @@ jobs:
           wc -l /tmp/train.log
           cat -A /tmp/train.log | head -40
 
+      # Annotations are readable through the public API; logs are not. This is
+      # the only way to see the runner's actual output without handing out a
+      # token, and it is why the failing assertion could be diagnosed at all.
+      - name: Publish the log as an annotation
+        run: |
+          python - <<'PYEOF'
+          data = open("/tmp/train.log").read()
+          print("bytes:", len(data), " lines:", data.count(chr(10)))
+          encoded = (data.replace("%", "%25")
+                         .replace(chr(13), "%0D")
+                         .replace(chr(10), "%0A"))
+          print("::warning title=trainlog::" + encoded[:4000])
+          PYEOF
+
       - name: Assert the log reports an expected initial loss
         run: |
           python - <<'PYEOF'

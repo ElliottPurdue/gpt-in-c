@@ -195,6 +195,212 @@ static void test_gradients_accumulate_rather_than_overwrite(void)
     tensor_free(&once); tensor_free(&twice);
 }
 
+static void test_attention_forward_and_backward(void)
+{
+    const tensor *x = oracle_require(&units, "attention.x");
+    const tensor *qkv_w = oracle_require(&units, "attention.qkv_w");
+    const tensor *qkv_b = oracle_require(&units, "attention.qkv_b");
+    const tensor *expected = oracle_require(&units, "attention.out");
+    const tensor *dout = oracle_require(&units, "attention.dout");
+    const tensor *expected_att = oracle_require(&units, "attention.att");
+
+    int B = x->dims[0], T = x->dims[1], C = x->dims[2];
+    int n_head = expected_att->dims[1];
+
+    tensor out = like(expected);
+    tensor qkv = tensor_alloc3(B, T, 3 * C);
+    tensor att = like(expected_att);
+
+    /* Poisoned before the call, not left zeroed.
+     *
+     * These buffers are reused every step in training, so a forward pass that
+     * relies on them arriving clean works exactly once. In particular the
+     * masked upper triangle of att has to be written, not merely left alone --
+     * a fresh calloc'd buffer hides that, and this caught a mutation that
+     * removing the zeroing otherwise survived.
+     */
+    for (int i = 0; i < out.size; ++i) {
+        out.data[i] = -7777.0f;
+    }
+    for (int i = 0; i < qkv.size; ++i) {
+        qkv.data[i] = -7777.0f;
+    }
+    for (int i = 0; i < att.size; ++i) {
+        att.data[i] = -7777.0f;
+    }
+
+    attention_forward(out.data, qkv.data, att.data, x->data,
+                      qkv_w->data, qkv_b->data, B, T, C, n_head);
+
+    CHECK_MATCHES(&out, expected, ABS_TOL, REL_TOL);
+
+    /* The attention weights themselves are compared, not just the output. A
+     * wrong mask or a wrong scale can still produce a plausible output while
+     * the weights are visibly wrong, and this localises that. */
+    CHECK_MATCHES(&att, expected_att, ABS_TOL, REL_TOL);
+
+    tensor dx = like(x), dqkv_w = like(qkv_w), dqkv_b = like(qkv_b);
+    tensor dqkv = like(&qkv), datt = like(&att);
+
+    attention_backward(dx.data, dqkv_w.data, dqkv_b.data, dqkv.data, datt.data,
+                       dout->data, x->data, qkv_w->data, qkv.data, att.data,
+                       B, T, C, n_head);
+
+    CHECK_MATCHES(&dx, oracle_require(&units, "attention.dx"), ABS_TOL, REL_TOL);
+    CHECK_MATCHES(&dqkv_w, oracle_require(&units, "attention.dqkv_w"), ABS_TOL, REL_TOL);
+    CHECK_MATCHES(&dqkv_b, oracle_require(&units, "attention.dqkv_b"), ABS_TOL, REL_TOL);
+
+    /* The attention-weight gradient is compared only on the causal region, and
+     * the reason is worth stating because it looks like a fudge.
+     *
+     * PyTorch forms the full T x T product y = att @ v, so autograd computes
+     * datt[i][j] = sum_d dy[i][d] * v[j][d] for every j -- including j > i,
+     * where att itself is zero. Those entries are real numbers in the oracle
+     * and exactly zero here, because this implementation never forms the upper
+     * triangle at all.
+     *
+     * Neither is wrong: the masked entries are dead. Softmax backward
+     * multiplies each by its own att value, which is zero, so nothing they
+     * contain ever reaches a parameter. The proof is immediately above -- dx,
+     * dqkv_w and dqkv_b all agree with autograd to 1e-5 despite this
+     * difference. Comparing the causal region still catches a wrong softmax
+     * Jacobian, a wrong scale, or a transposed v.
+     */
+    const tensor *expected_datt = oracle_require(&units, "attention.datt");
+    tensor masked = like(expected_datt);
+    for (int b_ = 0; b_ < B; ++b_) {
+        for (int h_ = 0; h_ < n_head; ++h_) {
+            for (int i_ = 0; i_ < T; ++i_) {
+                for (int j_ = 0; j_ <= i_; ++j_) {
+                    size_t k_ = (((size_t)b_ * n_head + h_) * T + i_) * T + j_;
+                    masked.data[k_] = expected_datt->data[k_];
+                }
+            }
+        }
+    }
+    CHECK_MATCHES(&datt, &masked, ABS_TOL, REL_TOL);
+
+    /* And assert the upper triangle really is untouched, so the masking above
+     * cannot hide this implementation writing something there. */
+    for (int b_ = 0; b_ < B; ++b_) {
+        for (int h_ = 0; h_ < n_head; ++h_) {
+            for (int i_ = 0; i_ < T; ++i_) {
+                for (int j_ = i_ + 1; j_ < T; ++j_) {
+                    size_t k_ = (((size_t)b_ * n_head + h_) * T + i_) * T + j_;
+                    CHECK(datt.data[k_] == 0.0f);
+                }
+            }
+        }
+    }
+    tensor_free(&masked);
+
+    tensor_free(&out); tensor_free(&qkv); tensor_free(&att);
+    tensor_free(&dx); tensor_free(&dqkv_w); tensor_free(&dqkv_b);
+    tensor_free(&dqkv); tensor_free(&datt);
+}
+
+static void test_attention_cannot_see_the_future(void)
+{
+    /* The causal mask, asserted directly rather than inferred from the output.
+     *
+     * A model whose mask leaks reads the token it is being asked to predict,
+     * so its training loss collapses toward zero and its generated text is
+     * garbage. That failure looks like success on every metric printed during
+     * training, which is why this is checked structurally.
+     */
+    const int B = 1, T = 5, C = 4, n_head = 2;
+    tensor x = tensor_alloc3(B, T, C);
+    tensor qkv_w = tensor_alloc2(3 * C, C);
+    tensor qkv_b = tensor_alloc(1, (int[]){ 3 * C });
+    tensor out = tensor_alloc3(B, T, C);
+    tensor qkv = tensor_alloc3(B, T, 3 * C);
+    tensor att = tensor_alloc4(B, n_head, T, T);
+
+    for (int i = 0; i < x.size; ++i) {
+        x.data[i] = 0.1f * (float)(i % 7) - 0.3f;
+    }
+    for (int i = 0; i < qkv_w.size; ++i) {
+        qkv_w.data[i] = 0.05f * (float)((i % 11) - 5);
+    }
+    for (int i = 0; i < att.size; ++i) {
+        att.data[i] = 123.0f;       /* must be overwritten, including the mask */
+    }
+
+    attention_forward(out.data, qkv.data, att.data, x.data,
+                      qkv_w.data, qkv_b.data, B, T, C, n_head);
+
+    for (int h = 0; h < n_head; ++h) {
+        for (int i = 0; i < T; ++i) {
+            float row_sum = 0.0f;
+            for (int j = 0; j < T; ++j) {
+                float w = att.data[((size_t)h * T + i) * T + j];
+                if (j > i) {
+                    CHECK(w == 0.0f);       /* strictly future: no weight at all */
+                } else {
+                    CHECK(w > 0.0f);
+                    row_sum += w;
+                }
+            }
+            CHECK_NEAR(row_sum, 1.0f, 1e-5);
+        }
+    }
+
+    /* Position 0 attends only to itself, so its output must be exactly its own
+     * value vector -- a check that does not depend on any other position. */
+    for (int h = 0; h < n_head; ++h) {
+        CHECK_NEAR(att.data[(size_t)h * T * T], 1.0f, 1e-6);
+    }
+
+    tensor_free(&x); tensor_free(&qkv_w); tensor_free(&qkv_b);
+    tensor_free(&out); tensor_free(&qkv); tensor_free(&att);
+}
+
+static void test_editing_a_later_token_cannot_change_an_earlier_output(void)
+{
+    /* The behavioural consequence of the mask, and the one that actually
+     * matters: changing token t must leave outputs 0..t-1 bit-identical. The
+     * structural test above would still pass if the value vectors were mixed
+     * across positions somewhere after the softmax. */
+    const int B = 1, T = 6, C = 4, n_head = 2;
+    tensor x = tensor_alloc3(B, T, C);
+    tensor qkv_w = tensor_alloc2(3 * C, C);
+    tensor qkv_b = tensor_alloc(1, (int[]){ 3 * C });
+    tensor out_a = tensor_alloc3(B, T, C), out_b = tensor_alloc3(B, T, C);
+    tensor qkv = tensor_alloc3(B, T, 3 * C);
+    tensor att = tensor_alloc4(B, n_head, T, T);
+
+    for (int i = 0; i < x.size; ++i) {
+        x.data[i] = 0.2f * (float)(i % 5) - 0.4f;
+    }
+    for (int i = 0; i < qkv_w.size; ++i) {
+        qkv_w.data[i] = 0.05f * (float)((i % 11) - 5);
+    }
+
+    attention_forward(out_a.data, qkv.data, att.data, x.data,
+                      qkv_w.data, qkv_b.data, B, T, C, n_head);
+
+    const int edited = 4;
+    for (int c = 0; c < C; ++c) {
+        x.data[(size_t)edited * C + c] += 17.0f;    /* a large, obvious change */
+    }
+    attention_forward(out_b.data, qkv.data, att.data, x.data,
+                      qkv_w.data, qkv_b.data, B, T, C, n_head);
+
+    for (int i = 0; i < edited; ++i) {
+        for (int c = 0; c < C; ++c) {
+            size_t k = (size_t)i * C + c;
+            CHECK(out_a.data[k] == out_b.data[k]);
+        }
+    }
+    /* And the edited position itself must have moved, or the test proves
+     * nothing about the mask -- only that the input was ignored. */
+    CHECK(out_a.data[(size_t)edited * C] != out_b.data[(size_t)edited * C]);
+
+    tensor_free(&x); tensor_free(&qkv_w); tensor_free(&qkv_b);
+    tensor_free(&out_a); tensor_free(&out_b);
+    tensor_free(&qkv); tensor_free(&att);
+}
+
 void register_op_tests(void)
 {
     if (!oracle_load(&units, "data/units.bin")) {
@@ -208,6 +414,9 @@ void register_op_tests(void)
     RUN(test_crossentropy_forward_and_backward);
     RUN(test_softmax_survives_logits_that_would_overflow);
     RUN(test_gradients_accumulate_rather_than_overwrite);
+    RUN(test_attention_forward_and_backward);
+    RUN(test_attention_cannot_see_the_future);
+    RUN(test_editing_a_later_token_cannot_change_an_earlier_output);
 
     oracle_free(&units);
 }

@@ -83,4 +83,37 @@ float crossentropy_forward(float *probs, const float *logits,
 void crossentropy_backward(float *dlogits, const float *probs,
                            const int *targets, int rows, int classes);
 
+/* ---- Multi-head causal self-attention -----------------------------------
+ *
+ * Covers the fused QKV projection through to the merged output, but not the
+ * output projection that follows it -- that is an ordinary linear, and keeping
+ * it outside means this function has one job.
+ *
+ * LAYOUT. qkv is (B, T, 3C), holding q, k and v concatenated along the last
+ * axis in that order, which is what a single projection produces and what
+ * PyTorch's split(C, dim=2) expects. Within each of those C-wide sections the
+ * heads are laid out contiguously, so head h of q at position t starts at
+ * qkv[((b*T + t)*3 + 0)*C + h*head_dim]. That indexing is the whole of the
+ * "transpose(1, 2)" the PyTorch version writes explicitly; no data moves.
+ *
+ * att is (B, n_head, T, T), holding the softmax output. Entries above the
+ * diagonal are written as exact zero rather than left undefined, so the buffer
+ * can be compared against PyTorch's masked result directly.
+ *
+ * The caller owns qkv and att. They are outputs of the forward pass and inputs
+ * to the backward pass: recomputing them would cost a second forward pass, and
+ * caching them inside would mean the library allocating.
+ */
+void attention_forward(float *out, float *qkv, float *att,
+                       const float *x, const float *qkv_w, const float *qkv_b,
+                       int B, int T, int C, int n_head);
+
+/* dqkv and datt are scratch, sized like qkv and att. The caller zeroes them;
+ * like every other backward here, gradients accumulate. */
+void attention_backward(float *dx, float *dqkv_w, float *dqkv_b,
+                        float *dqkv, float *datt,
+                        const float *dout, const float *x, const float *qkv_w,
+                        const float *qkv, const float *att,
+                        int B, int T, int C, int n_head);
+
 #endif /* OPS_H */

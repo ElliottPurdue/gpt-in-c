@@ -275,3 +275,153 @@ void crossentropy_backward(float *dlogits, const float *probs,
         dr[targets[r]] -= scale;
     }
 }
+
+/* ------------------------------------------------------------------------
+ * Multi-head causal self-attention
+ * ------------------------------------------------------------------------ */
+
+/* Offsets into the (B, T, 3C) projection buffer. `which` is 0 for q, 1 for k,
+ * 2 for v. Written once and used by both passes, because getting this indexing
+ * wrong in only one of them produces a gradient that is subtly incorrect rather
+ * than obviously so. */
+static size_t qkv_offset(int b, int t, int which, int head, int T, int C,
+                         int head_dim)
+{
+    return ((size_t)(b * T + t) * 3 + which) * C + (size_t)head * head_dim;
+}
+
+void attention_forward(float *out, float *qkv, float *att,
+                       const float *x, const float *qkv_w, const float *qkv_b,
+                       int B, int T, int C, int n_head)
+{
+    int head_dim = C / n_head;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    linear_forward(qkv, x, qkv_w, qkv_b, B * T, C, 3 * C);
+
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < n_head; ++h) {
+            float *att_head = att + ((size_t)b * n_head + h) * T * T;
+
+            for (int i = 0; i < T; ++i) {
+                const float *q = qkv + qkv_offset(b, i, 0, h, T, C, head_dim);
+                float *att_row = att_head + (size_t)i * T;
+
+                /* Causality is enforced by never computing the scores above the
+                 * diagonal, rather than by computing them and adding -inf. The
+                 * result is identical and it halves the work, but the entries
+                 * still have to be zeroed: the backward pass and the oracle
+                 * comparison both read the full row. */
+                float maximum = -INFINITY;
+                for (int j = 0; j <= i; ++j) {
+                    const float *k = qkv + qkv_offset(b, j, 1, h, T, C, head_dim);
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        dot += q[d] * k[d];
+                    }
+                    /* The 1/sqrt(head_dim) scale keeps the logits' variance
+                     * independent of head size. Without it softmax saturates as
+                     * the model widens and the gradients vanish. */
+                    dot *= scale;
+                    att_row[j] = dot;
+                    if (dot > maximum) {
+                        maximum = dot;
+                    }
+                }
+
+                float sum = 0.0f;
+                for (int j = 0; j <= i; ++j) {
+                    float e = expf(att_row[j] - maximum);
+                    att_row[j] = e;
+                    sum += e;
+                }
+                float inv = 1.0f / sum;
+                for (int j = 0; j <= i; ++j) {
+                    att_row[j] *= inv;
+                }
+                for (int j = i + 1; j < T; ++j) {
+                    att_row[j] = 0.0f;
+                }
+
+                /* Merge straight into the (B, T, C) output. Writing to a
+                 * (B, n_head, T, head_dim) buffer and transposing afterwards
+                 * would need a second pass over the same data. */
+                float *outi = out + ((size_t)b * T + i) * C + (size_t)h * head_dim;
+                for (int d = 0; d < head_dim; ++d) {
+                    outi[d] = 0.0f;
+                }
+                for (int j = 0; j <= i; ++j) {
+                    const float *v = qkv + qkv_offset(b, j, 2, h, T, C, head_dim);
+                    float weight = att_row[j];
+                    for (int d = 0; d < head_dim; ++d) {
+                        outi[d] += weight * v[d];
+                    }
+                }
+            }
+        }
+    }
+}
+
+void attention_backward(float *dx, float *dqkv_w, float *dqkv_b,
+                        float *dqkv, float *datt,
+                        const float *dout, const float *x, const float *qkv_w,
+                        const float *qkv, const float *att,
+                        int B, int T, int C, int n_head)
+{
+    int head_dim = C / n_head;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < n_head; ++h) {
+            const float *att_head = att + ((size_t)b * n_head + h) * T * T;
+            float *datt_head = datt + ((size_t)b * n_head + h) * T * T;
+
+            for (int i = 0; i < T; ++i) {
+                const float *att_row = att_head + (size_t)i * T;
+                float *datt_row = datt_head + (size_t)i * T;
+                const float *douti = dout + ((size_t)b * T + i) * C
+                                   + (size_t)h * head_dim;
+
+                /* y[i] = sum_j att[i][j] * v[j], so the incoming gradient splits
+                 * into one term for the weights and one for the values. */
+                for (int j = 0; j <= i; ++j) {
+                    const float *v = qkv + qkv_offset(b, j, 2, h, T, C, head_dim);
+                    float *dv = dqkv + qkv_offset(b, j, 2, h, T, C, head_dim);
+
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        dot += douti[d] * v[d];
+                        dv[d] += att_row[j] * douti[d];
+                    }
+                    datt_row[j] = dot;
+                }
+
+                /* Softmax backward, restricted to the unmasked prefix. The
+                 * masked entries need no special handling: att is zero there, so
+                 * their contribution to the row's dot product and to their own
+                 * gradient is zero either way. */
+                float dot = 0.0f;
+                for (int j = 0; j <= i; ++j) {
+                    dot += datt_row[j] * att_row[j];
+                }
+
+                float *dq = dqkv + qkv_offset(b, i, 0, h, T, C, head_dim);
+                const float *q = qkv + qkv_offset(b, i, 0, h, T, C, head_dim);
+
+                for (int j = 0; j <= i; ++j) {
+                    float dscore = att_row[j] * (datt_row[j] - dot) * scale;
+
+                    const float *k = qkv + qkv_offset(b, j, 1, h, T, C, head_dim);
+                    float *dk = dqkv + qkv_offset(b, j, 1, h, T, C, head_dim);
+
+                    for (int d = 0; d < head_dim; ++d) {
+                        dq[d] += dscore * k[d];
+                        dk[d] += dscore * q[d];
+                    }
+                }
+            }
+        }
+    }
+
+    linear_backward(dx, dqkv_w, dqkv_b, dqkv, x, qkv_w, B * T, C, 3 * C);
+}

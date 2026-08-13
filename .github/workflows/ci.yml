@@ -1,0 +1,101 @@
+# The point of running this in CI is that the repository's central claim --
+# every gradient matches PyTorch, and the tests would notice if one did not --
+# becomes checkable by anyone rather than asserted in a README.
+#
+# The oracle data is not committed, so CI regenerates it from ref/*.py on every
+# run. That costs a PyTorch install, and it is the right trade: a committed
+# binary blob proves only that the blob and the code agree, not that either
+# matches what PyTorch computes today.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyTorch (CPU)
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+      - name: Generate the oracle
+        run: make oracle PYTHON=python
+
+      - name: Report the floating-point environment
+        # -msse2 -mfpmath=sse is a no-op on x86-64, where SSE2 is baseline and
+        # FLT_EVAL_METHOD is already 0. It matters on 32-bit x86, where gcc
+        # defaults to x87 and evaluates float expressions in 80 bits -- which
+        # silently makes the library more accurate than the float32 it claims.
+        # Printing it here means the tolerance figures always have a stated
+        # precision behind them.
+        run: |
+          printf '#include <stdio.h>\n#include <float.h>\nint main(void){printf("FLT_EVAL_METHOD=%d, %zu-bit\\n", FLT_EVAL_METHOD, sizeof(void*)*8); return 0;}\n' > /tmp/fp.c
+          gcc -O2 -msse2 -mfpmath=sse /tmp/fp.c -o /tmp/fp && /tmp/fp
+
+      - name: Run the test suite
+        run: make test PYTHON=python
+
+  mutate:
+    name: mutation suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyTorch (CPU)
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+      - name: Generate the oracle
+        run: make oracle PYTHON=python
+
+      # Breaks the library on purpose, one bug at a time, and fails if the tests
+      # do not notice. A surviving mutation is a hole in the suite, and the job
+      # exits non-zero so it cannot be missed.
+      - name: Break it on purpose
+        run: python tools/mutate.py
+
+  train:
+    name: it trains
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A short run, checked for the one thing that must be true of any correct
+      # language model at step 1: the loss starts at the entropy of a uniform
+      # distribution over the vocabulary. A model that starts anywhere else is
+      # misinitialised, and no amount of later training makes that fine.
+      - name: Train briefly and check the starting loss
+        run: |
+          make data/input.txt PYTHON=python
+          make build/train PYTHON=python
+          ./build/train data/input.txt 20 | tee /tmp/train.log
+          python - <<'EOF'
+          import re, sys
+          log = open("/tmp/train.log").read()
+          expected = float(re.search(r"expected initial loss\s+([\d.]+)", log).group(1))
+          first = float(re.search(r"step\s+1\s+train\s+([\d.]+)", log).group(1))
+          last = float(re.findall(r"train\s+([\d.]+)", log)[-1])
+          print(f"expected {expected:.4f}, got {first:.4f}, ended {last:.4f}")
+          if abs(first - expected) > 0.15:
+              sys.exit(f"initial loss {first} is not ln(vocab_size) {expected}")
+          if last >= first:
+              sys.exit(f"loss did not decrease: {first} -> {last}")
+          EOF

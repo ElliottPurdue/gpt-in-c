@@ -1,5 +1,7 @@
 # GPT in C
 
+[![tests](https://github.com/ElliottPurdue/gpt-in-c/actions/workflows/ci.yml/badge.svg)](https://github.com/ElliottPurdue/gpt-in-c/actions/workflows/ci.yml)
+
 A transformer implemented from scratch in dependency-free C99 — forward pass
 *and* hand-derived backward pass — with PyTorch used as a numerical oracle
 rather than as a framework.
@@ -144,8 +146,11 @@ exact agreement is not available; these bounds are about two orders of magnitude
 tighter than any real bug produces.
 
 A test suite that passes proves nothing on its own, so the suite is checked by
-breaking the implementation on purpose. **Thirty-five mutations, thirty-five
-caught** — though not all on the first attempt; see below.
+breaking the implementation on purpose. That check is scripted rather than
+described — `make mutate` applies each bug in turn, rebuilds, runs the suite,
+restores the file, and exits non-zero if anything survives. CI runs it on every
+push, so the claim below is verified rather than asserted. **Thirty-eight mutations, thirty-eight caught,
+zero survivors** — though not all on the first attempt; see below.
 
 Ten of those target the assembled model rather than individual operations:
 dropping either residual connection, dropping the position embedding, post-norm
@@ -178,6 +183,19 @@ LayerNorm's saved statistics.
 | Attention, forget to zero the output accumulator | caught *(2nd attempt)* |
 | AdamW, omit the bias correction | caught |
 | AdamW, couple weight decay into the gradient | caught |
+| AdamW, drop the second-moment normalisation | caught |
+| Gradient clipping, scale by the norm instead of the limit | caught |
+| Tokenizer, index the vocabulary by byte value | caught |
+| Tokenizer, decode through the wrong table | caught |
+| Linear forward, forget the bias | caught |
+
+The full list lives in `tools/mutate.py`, and `make mutate` runs it in about a
+minute. Every mutation must still **compile**: `-Werror` rejects an unused
+variable, so deleting a term outright often fails the build rather than the
+tests — which looks identical to being caught and is not. Terms are multiplied
+by zero instead, and anything that fails to compile is reported as inconclusive
+rather than counted as a pass. One mutation was scored that way on the first run
+and had to be rewritten.
 
 The LayerNorm ones matter most. Its backward pass has two terms that exist only
 because the mean and variance are themselves functions of every element in the
@@ -323,7 +341,8 @@ objects compile for a freestanding target. Loading oracle dumps lives in
 ```
 src/        tensor.{h,c}  ops.{h,c}                    the library
 ref/        reference.py  units.py                     PyTorch oracle
-tests/      oracle.{h,c}  test.h  test_ops.c           host only
+tests/      oracle.{h,c}  test.h  test_*.c             host only
+tools/      mutate.py                                the mutation suite
 data/       generated oracle dumps, not committed
 ```
 

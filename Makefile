@@ -21,7 +21,7 @@ TESTS = tests/main.c tests/oracle.c tests/test_ops.c tests/test_model.c tests/te
 
 PYTHON ?= python
 
-.PHONY: all test oracle train clean
+.PHONY: all test oracle train mutate clean
 
 all: test
 
@@ -54,6 +54,11 @@ data/input.txt: $(wildcard src/*.c src/*.h tests/*.c ref/*.py) README.md
 	mkdir -p data
 	cat src/*.c src/*.h tests/*.c tests/*.h ref/*.py train.c README.md > $@
 	@wc -c < $@ | xargs echo "  corpus bytes:"
+
+# Breaks the library on purpose, one bug at a time, and checks the suite
+# notices. A passing suite is evidence about the tests only if they can fail.
+mutate:
+	$(PYTHON) tools/mutate.py
 
 clean:
 	rm -rf build

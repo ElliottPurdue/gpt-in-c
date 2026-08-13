@@ -29,6 +29,108 @@ static double seconds_now(void)
     return (double)clock() / (double)CLOCKS_PER_SEC;
 }
 
+/* Checkpoint format, little-endian:
+ *
+ *     magic "GPTC", uint32 version
+ *     5 x int32 config (vocab, block, layer, head, embd)
+ *     uint32 vocab byte table length, then that many bytes
+ *     float32 parameters, in the library's own flat layout
+ *
+ * The parameters are one contiguous block by construction, so writing them is a
+ * single fwrite and no serialiser has to know the model's structure. The config
+ * is stored ahead of them and checked on load: a checkpoint from a different
+ * shape would otherwise be read as garbage of the right length.
+ *
+ * The vocabulary travels with the weights. Token ids mean nothing without the
+ * table that produced them, and a checkpoint loaded against a different corpus
+ * would generate confident nonsense rather than fail.
+ *
+ * File I/O lives here rather than in src/ so the library keeps no stdio
+ * dependency; on a microcontroller the same bytes would be linked in as an
+ * array instead.
+ */
+#define CHECKPOINT_MAGIC "GPTC"
+#define CHECKPOINT_VERSION 1u
+
+static int save_checkpoint(const char *path, const gpt_model *model,
+                           const tokenizer *tok)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        return 0;
+    }
+
+    int header[5] = { model->config.vocab_size, model->config.block_size,
+                      model->config.n_layer, model->config.n_head,
+                      model->config.n_embd };
+    unsigned version = CHECKPOINT_VERSION;
+    unsigned vocab = (unsigned)tok->vocab_size;
+
+    int ok = fwrite(CHECKPOINT_MAGIC, 1, 4, f) == 4
+          && fwrite(&version, sizeof(version), 1, f) == 1
+          && fwrite(header, sizeof(int), 5, f) == 5
+          && fwrite(&vocab, sizeof(vocab), 1, f) == 1
+          && fwrite(tok->to_byte, 1, vocab, f) == vocab
+          && fwrite(model->params.storage, sizeof(float), model->params.count, f)
+             == model->params.count;
+
+    fclose(f);
+    return ok;
+}
+
+static int load_checkpoint(const char *path, gpt_model *model, tokenizer *tok)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return 0;
+    }
+
+    char magic[4];
+    unsigned version = 0, vocab = 0;
+    int header[5] = { 0, 0, 0, 0, 0 };
+
+    int ok = fread(magic, 1, 4, f) == 4
+          && memcmp(magic, CHECKPOINT_MAGIC, 4) == 0
+          && fread(&version, sizeof(version), 1, f) == 1
+          && version == CHECKPOINT_VERSION
+          && fread(header, sizeof(int), 5, f) == 5;
+
+    if (ok) {
+        gpt_config c = model->config;
+        ok = header[0] == c.vocab_size && header[1] == c.block_size
+          && header[2] == c.n_layer && header[3] == c.n_head
+          && header[4] == c.n_embd;
+        if (!ok) {
+            fprintf(stderr,
+                    "checkpoint is for a %d-layer, width-%d model; "
+                    "this one is %d-layer, width-%d\n",
+                    header[2], header[4], c.n_layer, c.n_embd);
+        }
+    }
+
+    if (ok) {
+        ok = fread(&vocab, sizeof(vocab), 1, f) == 1
+          && vocab <= TOKENIZER_MAX_VOCAB
+          && fread(tok->to_byte, 1, vocab, f) == vocab;
+    }
+    if (ok) {
+        /* Rebuild the reverse map rather than storing it: it is derivable, and
+         * a stored copy is one more thing that can disagree with itself. */
+        tok->vocab_size = (int)vocab;
+        for (int i = 0; i < TOKENIZER_MAX_VOCAB; ++i) {
+            tok->to_token[i] = -1;
+        }
+        for (int i = 0; i < tok->vocab_size; ++i) {
+            tok->to_token[tok->to_byte[i]] = i;
+        }
+        ok = fread(model->params.storage, sizeof(float), model->params.count, f)
+             == model->params.count;
+    }
+
+    fclose(f);
+    return ok;
+}
+
 static unsigned char *read_file(const char *path, size_t *length)
 {
     FILE *f = fopen(path, "rb");
@@ -113,6 +215,8 @@ int main(int argc, char **argv)
 {
     const char *path = (argc > 1) ? argv[1] : "data/input.txt";
     int steps = (argc > 2) ? atoi(argv[2]) : 500;
+    const char *checkpoint = (argc > 3) ? argv[3] : NULL;
+    const char *resume = (argc > 4) ? argv[4] : NULL;
 
     size_t file_length = 0;
     unsigned char *text = read_file(path, &file_length);
@@ -178,6 +282,14 @@ int main(int argc, char **argv)
     printf("  expected initial loss  %.4f  (ln %d)\n\n",
            (double)logf((float)tok.vocab_size), tok.vocab_size);
 
+    if (resume) {
+        if (!load_checkpoint(resume, &model, &tok)) {
+            fprintf(stderr, "could not load checkpoint %s\n", resume);
+            return 1;
+        }
+        printf("  resumed from %s\n", resume);
+    }
+
     unsigned rng = 42u;
     double start_time = seconds_now();
     double train_seconds = 0.0;
@@ -211,6 +323,15 @@ int main(int argc, char **argv)
     printf("\n  %d steps in %.1f s, %.0f tokens/s\n",
            steps, seconds_now() - start_time,
            (double)tokens_seen / train_seconds);
+
+    if (checkpoint) {
+        if (save_checkpoint(checkpoint, &model, &tok)) {
+            printf("\n  wrote %s (%zu parameters)\n",
+                   checkpoint, model.params.count);
+        } else {
+            fprintf(stderr, "\n  could not write %s\n", checkpoint);
+        }
+    }
 
     printf("\n  sample at temperature 0.8:\n");
     print_sample(&model, &tok, tokens, T, &rng);

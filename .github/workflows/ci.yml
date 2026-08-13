@@ -104,42 +104,45 @@ jobs:
       - name: Show the training log
         run: cat /tmp/train.log
 
-      # Split one assertion per step. Action logs need authentication to read,
-      # but the step list does not, so a failure names itself.
-      - name: Assert the log parsed
+      # Parsed by splitting on whitespace rather than by regex. This check lives
+      # in a YAML block scalar inside a shell heredoc, and each of those layers
+      # treats backslashes differently, so a pattern that is correct in the file
+      # is not necessarily the pattern Python receives. Splitting needs no
+      # escapes and cannot break in transit.
+      - name: Check the initial loss and that training reduces it
         run: |
-          python - <<'EOF'
-          import re, sys
-          log = open("/tmp/train.log").read()
-          for name, pattern in [("expected", r"expected initial loss\s+([\d.]+)"),
-                                ("first",    r"step\s+1\s+train\s+([\d.]+)"),
-                                ("any",      r"train\s+([\d.]+)")]:
-              if not re.search(pattern, log):
-                  sys.exit(f"pattern for {name} did not match the log")
-          print("all patterns matched")
-          EOF
+          python - <<'PYEOF'
+          import sys
 
-      - name: Assert the initial loss equals ln(vocab_size)
-        run: |
-          python - <<'EOF'
-          import re, sys
-          log = open("/tmp/train.log").read()
-          expected = float(re.search(r"expected initial loss\s+([\d.]+)", log).group(1))
-          first = float(re.search(r"step\s+1\s+train\s+([\d.]+)", log).group(1))
-          print(f"expected {expected:.4f}, got {first:.4f}")
-          if abs(first - expected) > 0.15:
-              sys.exit("initial loss is not the entropy of a uniform distribution")
-          EOF
+          expected = None
+          losses = []
 
-      - name: Assert the loss decreased
-        run: |
-          python - <<'EOF'
-          import re, sys
-          log = open("/tmp/train.log").read()
-          losses = [float(x) for x in re.findall(r"train\s+([\d.]+)", log)]
-          print("losses:", losses)
+          for line in open("/tmp/train.log"):
+              parts = line.split()
+              if parts[:3] == ["expected", "initial", "loss"]:
+                  expected = float(parts[3])
+              elif len(parts) >= 4 and parts[0] == "step" and parts[2] == "train":
+                  losses.append(float(parts[3]))
+
+          print("expected initial loss:", expected)
+          print("reported losses:", losses)
+
+          if expected is None:
+              sys.exit("the log did not report an expected initial loss")
           if len(losses) < 2:
-              sys.exit(f"expected at least two reported losses, saw {losses}")
+              sys.exit("expected at least two reported losses, saw %r" % (losses,))
+
+          # An untrained model is uniform over the vocabulary, so its loss must
+          # be ln(vocab_size). Anything else means the initialisation is wrong,
+          # and no amount of later training makes that acceptable.
+          if abs(losses[0] - expected) > 0.15:
+              sys.exit("initial loss %.4f is not ln(vocab_size) %.4f"
+                       % (losses[0], expected))
+
           if losses[-1] >= losses[0]:
-              sys.exit(f"loss did not decrease: {losses[0]} -> {losses[-1]}")
-          EOF
+              sys.exit("loss did not decrease: %.4f -> %.4f"
+                       % (losses[0], losses[-1]))
+
+          print("initial loss matches ln(vocab_size); loss decreased "
+                "%.4f -> %.4f" % (losses[0], losses[-1]))
+          PYEOF

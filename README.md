@@ -332,6 +332,15 @@ concatenated by a Makefile target. No download, fully reproducible, and C gives 
 character model plenty of structure to learn — matched braces, indentation,
 comment delimiters, identifier conventions.
 
+**A checkpoint carries its vocabulary.** Token ids mean nothing without the
+table that produced them, so the byte table is stored beside the weights; a
+checkpoint loaded against a different corpus would otherwise generate confident
+nonsense rather than fail. The config is stored ahead of the parameters and
+checked on load, since a checkpoint from a different shape is otherwise just
+bytes of the right length. The parameters themselves are one contiguous block by
+construction, so writing them is a single `fwrite` and no serialiser needs to
+know the model's structure.
+
 **No file I/O in `src/`.** The library has no stdio dependency, so the same
 objects compile for a freestanding target. Loading oracle dumps lives in
 `tests/`.

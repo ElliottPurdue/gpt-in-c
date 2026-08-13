@@ -26,8 +26,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PyTorch (CPU)
-        run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - name: Install PyTorch (CPU) and NumPy
+        # numpy is explicit: the oracle writer calls .numpy(), and the CPU torch
+        # wheel does not always pull it in.
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy
+          python -c "import torch, numpy; print('torch', torch.__version__, '| numpy', numpy.__version__)"
 
       - name: Generate the oracle
         run: make oracle PYTHON=python
@@ -56,8 +61,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PyTorch (CPU)
-        run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - name: Install PyTorch (CPU) and NumPy
+        # numpy is explicit: the oracle writer calls .numpy(), and the CPU torch
+        # wheel does not always pull it in.
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy
+          python -c "import torch, numpy; print('torch', torch.__version__, '| numpy', numpy.__version__)"
 
       - name: Generate the oracle
         run: make oracle PYTHON=python
@@ -82,11 +92,17 @@ jobs:
       # language model at step 1: the loss starts at the entropy of a uniform
       # distribution over the vocabulary. A model that starts anywhere else is
       # misinitialised, and no amount of later training makes that fine.
-      - name: Train briefly and check the starting loss
+      - name: Build the corpus
+        run: make data/input.txt PYTHON=python
+
+      - name: Build the trainer
+        run: make build/train PYTHON=python
+
+      - name: Train for 20 steps
+        run: ./build/train data/input.txt 20 | tee /tmp/train.log
+
+      - name: Check the starting loss and that it decreases
         run: |
-          make data/input.txt PYTHON=python
-          make build/train PYTHON=python
-          ./build/train data/input.txt 20 | tee /tmp/train.log
           python - <<'EOF'
           import re, sys
           log = open("/tmp/train.log").read()

@@ -26,14 +26,15 @@ Early. Working so far:
   cross-entropy, and multi-head causal self-attention, each forward and backward
 - `src/model.{h,c}` — the assembled GPT: embeddings, pre-norm blocks, LM head,
   forward and backward
+- `src/optim.{h,c}` — AdamW with decoupled weight decay, and gradient clipping
 - `ref/reference.py` — the PyTorch model, and a full forward/backward dump
 - `ref/units.py` — one isolated oracle case per operation
-- `tests/` — 15 tests, no framework
+- `tests/` — 20 tests, no framework
 
 The full model agrees with PyTorch on the loss, the logits, and **every one of
 its 30,144 parameter gradients**, to 2e-5 absolute or 2e-4 relative.
 
-Not yet built: AdamW, the tokenizer, and the training loop.
+Not yet built: the tokenizer and the training loop.
 
 ## Verification
 
@@ -75,6 +76,8 @@ LayerNorm's saved statistics.
 | Attention backward, index dv by att[j][i] | caught |
 | Attention, forget to zero the masked weights | caught *(2nd attempt)* |
 | Attention, forget to zero the output accumulator | caught *(2nd attempt)* |
+| AdamW, omit the bias correction | caught |
+| AdamW, couple weight decay into the gradient | caught |
 
 The LayerNorm ones matter most. Its backward pass has two terms that exist only
 because the mean and variance are themselves functions of every element in the
@@ -172,6 +175,20 @@ improves.
 
 **Exact GELU, not the tanh approximation.** The two differ by about 1e-3, three
 orders of magnitude above the tolerance these tests run at.
+
+**The build forces real float32 arithmetic**, with `-msse2 -mfpmath=sse`. This
+is a 32-bit toolchain, where gcc defaults to the x87 unit and `FLT_EVAL_METHOD`
+is 2: every float expression is evaluated in 80 bits and rounded to 32 only when
+stored. That makes the library quietly more accurate than the float32 it claims
+to be, hides error a real single-precision FPU would show, and — the symptom
+that exposed it — breaks exact comparisons, since a value in memory and the same
+value in a register are not bit-identical. A clipping test failed on
+`grads[0] == 0.3f` while the bytes were provably unchanged.
+
+The targets this code is written for, Cortex-M and Xtensa, have genuine 32-bit
+FPUs and no excess precision, so the host build is pinned to match them. Every
+gradient still agrees with PyTorch to 2e-5 without the extended-precision
+crutch, which is a stronger result than the one measured before.
 
 **The oracle is float32, not float64.** A float64 reference would be more
 precise than the thing it is checking, and the tolerances would then be

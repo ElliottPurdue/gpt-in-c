@@ -4,11 +4,20 @@ ifeq ($(origin CC),default)
 CC = gcc
 endif
 
-CFLAGS  = -std=c99 -O2 -Wall -Wextra -Werror -pedantic
+# -msse2 -mfpmath=sse is load-bearing, not tuning. This is a 32-bit toolchain,
+# where gcc defaults to the x87 unit and FLT_EVAL_METHOD is 2: every float
+# expression is evaluated in 80-bit extended precision and rounded to 32 bits
+# only when stored. That makes the library quietly more accurate than the
+# float32 it claims to be, hides error that a real single-precision FPU would
+# show, and breaks exact comparisons between a value in memory and the same
+# value in a register. Targets this code is meant for -- Cortex-M, Xtensa --
+# have genuine 32-bit FPUs and no excess precision, so the host build is pinned
+# to match them.
+CFLAGS  = -std=c99 -O2 -Wall -Wextra -Werror -pedantic -msse2 -mfpmath=sse
 LDFLAGS = -lm
 
-SRC   = src/tensor.c src/ops.c src/model.c
-TESTS = tests/main.c tests/oracle.c tests/test_ops.c tests/test_model.c
+SRC   = src/tensor.c src/ops.c src/model.c src/optim.c
+TESTS = tests/main.c tests/oracle.c tests/test_ops.c tests/test_model.c tests/test_optim.c
 
 PYTHON ?= python
 

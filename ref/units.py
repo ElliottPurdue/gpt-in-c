@@ -119,6 +119,54 @@ def build():
     tensors["crossentropy.loss"] = loss.reshape(1)
     tensors["crossentropy.dlogits"] = logits.grad
 
+    # ---- AdamW ------------------------------------------------------------
+    # Several steps, not one. The bias-correction terms decay with the step
+    # count, so a single step cannot distinguish a correct implementation from
+    # one that omits them -- at t=1 the correction is largest and most of the
+    # plausible errors still land close. Five steps separates them.
+    #
+    # A fixed gradient would also hide errors in the second moment, so each step
+    # gets a different one.
+    torch.manual_seed(SEED + 1)
+    param = torch.randn(24) * 0.5
+    grads = [torch.randn(24) * 0.1 for _ in range(5)]
+
+    tensors["adamw.initial"] = param.clone()
+    for i, g in enumerate(grads):
+        tensors[f"adamw.grad{i}"] = g
+
+    work = param.clone().requires_grad_(True)
+    optimizer = torch.optim.AdamW([work], lr=1e-2, betas=(0.9, 0.95),
+                                  eps=1e-8, weight_decay=0.1)
+    for i, g in enumerate(grads):
+        optimizer.zero_grad()
+        work.grad = g.clone()
+        optimizer.step()
+        tensors[f"adamw.after{i}"] = work.detach().clone()
+
+    # ---- AdamW, several steps ------------------------------------------
+    # One step is not enough to pin this. Adam's bias correction is largest at
+    # step 1 and decays, so an implementation that omits it entirely is closest
+    # to correct exactly where a single-step test would look. Running four steps
+    # and dumping each lets the test follow the correction as it fades.
+    torch.manual_seed(SEED + 1)
+    weight = torch.randn(6, 4, requires_grad=True)
+    start = weight.detach().clone()
+
+    optimizer = torch.optim.AdamW([weight], lr=1e-2, betas=(0.9, 0.999),
+                                  eps=1e-8, weight_decay=0.1)
+
+    tensors["adamw.initial"] = start
+    for step in range(4):
+        # A fixed, deterministic "gradient" rather than a real one: this checks
+        # the update rule, and coupling it to a model would only add a way for
+        # the test to fail for an unrelated reason.
+        grad = torch.sin(start * float(step + 1)) + 0.1 * float(step)
+        weight.grad = grad.clone()
+        tensors[f"adamw.grad{step}"] = grad
+        optimizer.step()
+        tensors[f"adamw.after{step}"] = weight.detach().clone()
+
     return tensors
 
 

@@ -99,50 +99,83 @@ jobs:
         run: make build/train PYTHON=python
 
       - name: Train for 20 steps
-        run: ./build/train data/input.txt 20 | tee /tmp/train.log
+        # pipefail: without it the pipeline reports tee's status, so a
+        # trainer that crashed halfway would still pass this step and fail
+        # the next one, blaming the wrong thing.
+        run: |
+          set -o pipefail
+          ./build/train data/input.txt 20 | tee /tmp/train.log
 
       - name: Show the training log
-        run: cat /tmp/train.log
+        run: |
+          wc -l /tmp/train.log
+          cat -A /tmp/train.log | head -40
 
-      # Parsed by splitting on whitespace rather than by regex. This check lives
-      # in a YAML block scalar inside a shell heredoc, and each of those layers
-      # treats backslashes differently, so a pattern that is correct in the file
-      # is not necessarily the pattern Python receives. Splitting needs no
-      # escapes and cannot break in transit.
-      - name: Check the initial loss and that training reduces it
+      - name: Assert the log reports an expected initial loss
         run: |
           python - <<'PYEOF'
           import sys
-
-          expected = None
-          losses = []
-
+          expected, losses = None, []
           for line in open("/tmp/train.log"):
               parts = line.split()
               if parts[:3] == ["expected", "initial", "loss"]:
                   expected = float(parts[3])
               elif len(parts) >= 4 and parts[0] == "step" and parts[2] == "train":
                   losses.append(float(parts[3]))
-
-          print("expected initial loss:", expected)
-          print("reported losses:", losses)
-
+          print("expected:", expected, " losses:", losses)
           if expected is None:
-              sys.exit("the log did not report an expected initial loss")
-          if len(losses) < 2:
-              sys.exit("expected at least two reported losses, saw %r" % (losses,))
+              sys.exit("no 'expected initial loss' line in the log")
+          PYEOF
 
-          # An untrained model is uniform over the vocabulary, so its loss must
-          # be ln(vocab_size). Anything else means the initialisation is wrong,
+      - name: Assert at least two losses were reported
+        run: |
+          python - <<'PYEOF'
+          import sys
+          expected, losses = None, []
+          for line in open("/tmp/train.log"):
+              parts = line.split()
+              if parts[:3] == ["expected", "initial", "loss"]:
+                  expected = float(parts[3])
+              elif len(parts) >= 4 and parts[0] == "step" and parts[2] == "train":
+                  losses.append(float(parts[3]))
+          print("expected:", expected, " losses:", losses)
+          if len(losses) < 2:
+              sys.exit("saw %d reported losses, need 2" % len(losses))
+          PYEOF
+
+      - name: Assert the initial loss equals ln(vocab_size)
+        run: |
+          python - <<'PYEOF'
+          import sys
+          expected, losses = None, []
+          for line in open("/tmp/train.log"):
+              parts = line.split()
+              if parts[:3] == ["expected", "initial", "loss"]:
+                  expected = float(parts[3])
+              elif len(parts) >= 4 and parts[0] == "step" and parts[2] == "train":
+                  losses.append(float(parts[3]))
+          print("expected:", expected, " losses:", losses)
+          # An untrained model is uniform over the vocabulary, so its loss
+          # must be ln(vocab_size). Anything else is a broken initialisation,
           # and no amount of later training makes that acceptable.
           if abs(losses[0] - expected) > 0.15:
               sys.exit("initial loss %.4f is not ln(vocab_size) %.4f"
                        % (losses[0], expected))
+          PYEOF
 
+      - name: Assert the loss decreased
+        run: |
+          python - <<'PYEOF'
+          import sys
+          expected, losses = None, []
+          for line in open("/tmp/train.log"):
+              parts = line.split()
+              if parts[:3] == ["expected", "initial", "loss"]:
+                  expected = float(parts[3])
+              elif len(parts) >= 4 and parts[0] == "step" and parts[2] == "train":
+                  losses.append(float(parts[3]))
+          print("expected:", expected, " losses:", losses)
           if losses[-1] >= losses[0]:
               sys.exit("loss did not decrease: %.4f -> %.4f"
                        % (losses[0], losses[-1]))
-
-          print("initial loss matches ln(vocab_size); loss decreased "
-                "%.4f -> %.4f" % (losses[0], losses[-1]))
           PYEOF

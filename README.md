@@ -24,11 +24,16 @@ Early. Working so far:
 - `src/tensor.{h,c}` — flat row-major float32 tensors, no strides or broadcasting
 - `src/ops.{h,c}` — linear, LayerNorm, GELU, softmax, fused softmax
   cross-entropy, and multi-head causal self-attention, each forward and backward
+- `src/model.{h,c}` — the assembled GPT: embeddings, pre-norm blocks, LM head,
+  forward and backward
 - `ref/reference.py` — the PyTorch model, and a full forward/backward dump
 - `ref/units.py` — one isolated oracle case per operation
-- `tests/` — 10 tests, no framework
+- `tests/` — 15 tests, no framework
 
-Not yet built: the assembled model, AdamW, the tokenizer, and the training loop.
+The full model agrees with PyTorch on the loss, the logits, and **every one of
+its 30,144 parameter gradients**, to 2e-5 absolute or 2e-4 relative.
+
+Not yet built: AdamW, the tokenizer, and the training loop.
 
 ## Verification
 
@@ -38,8 +43,14 @@ exact agreement is not available; these bounds are about two orders of magnitude
 tighter than any real bug produces.
 
 A test suite that passes proves nothing on its own, so the suite is checked by
-breaking the implementation on purpose. **Twenty-five mutations, twenty-five
-caught** — though not on the first attempt; see below.
+breaking the implementation on purpose. **Thirty-five mutations, thirty-five
+caught** — though not all on the first attempt; see below.
+
+Ten of those target the assembled model rather than individual operations:
+dropping either residual connection, dropping the position embedding, post-norm
+instead of pre-norm ordering, losing either residual path in the backward pass,
+walking the layers forward instead of in reverse, and using the wrong
+LayerNorm's saved statistics.
 
 | Mutation | Result |
 |---|---|
@@ -69,6 +80,29 @@ The LayerNorm ones matter most. Its backward pass has two terms that exist only
 because the mean and variance are themselves functions of every element in the
 row, and dropping them is the single most common error in a hand-written
 transformer. A model with that bug still trains.
+
+### A second, independent check on the gradients
+
+The oracle is precise but shares an assumption with the code it checks: both
+implement the same architecture from the same description, so a *misreading of
+the architecture* would be reproduced on both sides and agree perfectly.
+
+So the gradients are also checked against the definition of a derivative —
+perturb a parameter, measure how the loss actually moves, compare. That check
+knows nothing about transformers and cannot share the error.
+
+It is deliberately coarse. A central difference has truncation error growing
+with `eps²`, while float32 cancellation error grows as the loss difference
+shrinks, and the two squeeze the usable range of `eps` from both sides. The
+magnitude floor is derived rather than guessed: the difference moves the loss by
+about `2·eps·grad`, float32 resolves a loss near 4.3 to roughly 5e-7, and
+requiring several hundred times that gives `grad > 1e-2`. Below it the quotient
+is mostly noise — a gradient of 1e-3 shifts the loss by 2e-5, which carries
+barely two significant digits, and comparing that at 5% fails on rounding alone.
+
+Setting the floor at 1e-3 initially produced exactly that: one sampled parameter
+5.9% off, with PyTorch already confirming the same gradient to 2e-5. The fix was
+the arithmetic above, not a wider tolerance.
 
 ### Two mutations that survived, and what they exposed
 

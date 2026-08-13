@@ -7,8 +7,8 @@ endif
 CFLAGS  = -std=c99 -O2 -Wall -Wextra -Werror -pedantic
 LDFLAGS = -lm
 
-SRC   = src/tensor.c src/ops.c
-TESTS = tests/main.c tests/oracle.c tests/test_ops.c
+SRC   = src/tensor.c src/ops.c src/model.c
+TESTS = tests/main.c tests/oracle.c tests/test_ops.c tests/test_model.c
 
 PYTHON ?= python
 

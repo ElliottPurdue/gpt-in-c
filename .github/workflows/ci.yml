@@ -111,13 +111,20 @@ jobs:
           wc -l /tmp/train.log
           cat -A /tmp/train.log | head -40
 
+      # The log is read with errors="replace". It contains the generated text
+      # sample, which is raw bytes the model emits in arbitrary order -- including
+      # fragments of the multi-byte UTF-8 sequences in the corpus. That is not
+      # valid UTF-8, so a strict read raises UnicodeDecodeError on Linux while
+      # succeeding on Windows, where the default codec accepts any byte. Every
+      # assertion here failed on that, not on what it was asserting.
+
       # Annotations are readable through the public API; logs are not. This is
       # the only way to see the runner's actual output without handing out a
       # token, and it is why the failing assertion could be diagnosed at all.
       - name: Publish the log as an annotation
         run: |
           python - <<'PYEOF'
-          data = open("/tmp/train.log").read()
+          data = open("/tmp/train.log", encoding="utf-8", errors="replace").read()
           print("bytes:", len(data), " lines:", data.count(chr(10)))
           encoded = (data.replace("%", "%25")
                          .replace(chr(13), "%0D")
@@ -130,7 +137,7 @@ jobs:
           python - <<'PYEOF'
           import sys
           expected, losses = None, []
-          for line in open("/tmp/train.log"):
+          for line in open("/tmp/train.log", encoding="utf-8", errors="replace"):
               parts = line.split()
               if parts[:3] == ["expected", "initial", "loss"]:
                   expected = float(parts[3])
@@ -146,7 +153,7 @@ jobs:
           python - <<'PYEOF'
           import sys
           expected, losses = None, []
-          for line in open("/tmp/train.log"):
+          for line in open("/tmp/train.log", encoding="utf-8", errors="replace"):
               parts = line.split()
               if parts[:3] == ["expected", "initial", "loss"]:
                   expected = float(parts[3])
@@ -162,7 +169,7 @@ jobs:
           python - <<'PYEOF'
           import sys
           expected, losses = None, []
-          for line in open("/tmp/train.log"):
+          for line in open("/tmp/train.log", encoding="utf-8", errors="replace"):
               parts = line.split()
               if parts[:3] == ["expected", "initial", "loss"]:
                   expected = float(parts[3])
@@ -182,7 +189,7 @@ jobs:
           python - <<'PYEOF'
           import sys
           expected, losses = None, []
-          for line in open("/tmp/train.log"):
+          for line in open("/tmp/train.log", encoding="utf-8", errors="replace"):
               parts = line.split()
               if parts[:3] == ["expected", "initial", "loss"]:
                   expected = float(parts[3])

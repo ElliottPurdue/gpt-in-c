@@ -13,7 +13,7 @@ endif
 # value in a register. Targets this code is meant for -- Cortex-M, Xtensa --
 # have genuine 32-bit FPUs and no excess precision, so the host build is pinned
 # to match them.
-CFLAGS  = -std=c99 -O2 -Wall -Wextra -Werror -pedantic -msse2 -mfpmath=sse
+CFLAGS  = -std=c99 -O3 -Wall -Wextra -Werror -pedantic -msse2 -mfpmath=sse
 LDFLAGS = -lm
 
 SRC   = src/tensor.c src/ops.c src/model.c src/optim.c src/tokenizer.c

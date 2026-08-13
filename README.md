@@ -52,6 +52,9 @@ bytes, 105 distinct characters — a 3-layer, width-96, context-64 model of
   300 steps in 187.0 s, 1780 tokens/s
 ```
 
+(That run predates the matmul work below; the same 300 steps now take 132.8 s at
+2,534 tokens/s, with identical losses.)
+
 Sampling at temperature 0.8 after those 300 steps:
 
 ```
@@ -81,8 +84,57 @@ which is overfitting beginning, and expected with 362K parameters against 132K
 training tokens. It is visible only because the validation split is contiguous;
 see below.
 
-Not yet built: a blocked and threaded matmul. At 1,780 tokens/s the naive triple
-loop is the entire cost, and that is the next measurement worth taking.
+### Making it faster, and proving it still computes the same thing
+
+The naive matmul was the entire cost. Restructuring it is worth **1.42x** on the
+full 300-step run: 1,784 to 2,534 tokens/s, 187.0 s down to 132.8 s.
+
+Shorter 30-step runs, used to compare build flags:
+
+| build | tokens/s | training loss at step 30 |
+|---|---|---|
+| naive triple loop, `-O2` | 1,653 | 2.9605 |
+| blocked, `-O2` | 1,965 | 2.9605 |
+| blocked, `-O3` | **2,572** | 2.9605 |
+
+(Short runs measure high or low by 5-10% depending on warm-up, which is why the
+headline figure comes from the 300-step runs rather than this table.)
+
+**The loss column is the point.** Every value is bit-identical, because the
+summation order never changed — and that claim is checkable rather than
+rhetorical, since training is deterministic. Across all 300 steps, every
+training loss, validation loss and gradient norm matches the pre-optimisation
+run exactly:
+
+```
+step     1   train 4.6442   val 4.3820   |grad| 4.510      before and after
+step   150   train 2.2869   val 2.8396   |grad| 1.685      before and after
+step   300   train 2.0048   val 2.7374   |grad| 1.505      before and after
+```
+
+An optimisation that quietly altered the arithmetic would move that curve.
+
+**What was actually slow.** Not the arithmetic. The naive loop walks the whole
+weight matrix once per row, and the qkv projection's weights are 110 KB against
+a 32 KB L1 — so 1,024 rows cost about 113 MB of memory traffic to do 28 MFLOP of
+work. Processing rows in blocks of eight reuses each weight element eight times
+before evicting it. The backward pass splits into three loops so each can be
+blocked for the array it writes, which changes no summation order either: `dx`
+still accumulates over outputs ascending, `dW` and `db` over rows ascending,
+exactly as when the loops were nested.
+
+**What did not help.** `-march=native` was *slower* (2,456), and gcc 6.3.0 on
+this 32-bit toolchain does not vectorise the inner loop usefully. It would also
+have enabled FMA, which fuses a multiply and add into one rounding step and so
+would have changed results — losing the bit-identical property for a slowdown.
+
+`-O3` also paid for itself twice: its stronger analysis caught a genuine bug in
+the oracle loader, where a short read left a variable unwritten and the error
+path printed it. `-O2` never noticed.
+
+Threading is not done. OpenMP needs a pthread-capable toolchain, and the one
+here is 32-bit MinGW 6.3.0 without one. Single-threaded gains transfer to the
+microcontroller targets anyway, where there are no threads to use.
 
 ## Verification
 

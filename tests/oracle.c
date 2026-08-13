@@ -39,7 +39,11 @@ int oracle_load(oracle *store, const char *path)
     }
 
     char magic[4];
-    unsigned version, count;
+    /* Initialised because the failure paths below print them. read_u32 returns
+     * 0 without writing its output when the read is short, so an uninitialised
+     * declaration here means the error message reports whatever was on the
+     * stack -- which -O3's analysis catches and -O2's does not. */
+    unsigned version = 0, count = 0;
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, ORACLE_MAGIC, 4) != 0) {
         fprintf(stderr, "oracle: %s is not a GPTC file\n", path);
         fclose(f);
@@ -60,7 +64,7 @@ int oracle_load(oracle *store, const char *path)
 
     for (unsigned i = 0; i < count; ++i) {
         oracle_entry *entry = &store->entries[i];
-        unsigned name_length, ndim;
+        unsigned name_length = 0, ndim = 0;
 
         if (!read_u32(f, &name_length) || name_length >= ORACLE_MAX_NAME) {
             fprintf(stderr, "oracle: bad name length at tensor %u\n", i);

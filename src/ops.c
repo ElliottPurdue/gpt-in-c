@@ -7,58 +7,119 @@
  * Linear
  * ------------------------------------------------------------------------ */
 
+/* Rows are processed in blocks so that each row of the weight matrix is loaded
+ * once per block instead of once per row.
+ *
+ * The naive loop -- for each row, walk the whole weight matrix -- has good
+ * locality within a single dot product and terrible locality across them. The
+ * qkv projection's weights are 110 KB against a 32 KB L1, so every row evicts
+ * them and the next row reloads them: 1024 rows x 110 KB is about 113 MB of
+ * traffic for 28 MFLOP of arithmetic. The arithmetic was never the cost.
+ *
+ * With ROW_BLOCK rows in flight, one weight element is fetched and used
+ * ROW_BLOCK times before moving on, cutting weight traffic by that factor. The
+ * block of input rows is small enough to sit in L1 alongside it.
+ *
+ * The summation order is unchanged: each output element still accumulates over
+ * i from 0 upward. That is deliberate and load-bearing -- floating-point
+ * addition is not associative, so reordering it would change results, and the
+ * training loop's determinism is what proves this optimisation did not alter
+ * the mathematics. The loss curve after this change is bit-identical to the
+ * curve before it. */
+#define ROW_BLOCK 8
+#define OUT_BLOCK 16
+
 void linear_forward(float *out, const float *x, const float *weight,
                     const float *bias, int rows, int in_features,
                     int out_features)
 {
-    for (int r = 0; r < rows; ++r) {
-        const float *xr = x + (size_t)r * in_features;
-        float *outr = out + (size_t)r * out_features;
+    for (int r0 = 0; r0 < rows; r0 += ROW_BLOCK) {
+        int block = rows - r0 < ROW_BLOCK ? rows - r0 : ROW_BLOCK;
 
         for (int o = 0; o < out_features; ++o) {
             const float *wo = weight + (size_t)o * in_features;
-            float sum = bias ? bias[o] : 0.0f;
-            for (int i = 0; i < in_features; ++i) {
-                sum += xr[i] * wo[i];
+            float acc[ROW_BLOCK];
+
+            /* The whole array, not just the live prefix: the tail is never read,
+             * but proving that to the optimiser costs more than the eight
+             * stores, and -O3 rejects the build otherwise. */
+            for (int b = 0; b < ROW_BLOCK; ++b) {
+                acc[b] = bias ? bias[o] : 0.0f;
             }
-            outr[o] = sum;
+            for (int i = 0; i < in_features; ++i) {
+                float w = wo[i];
+                for (int b = 0; b < block; ++b) {
+                    acc[b] += x[(size_t)(r0 + b) * in_features + i] * w;
+                }
+            }
+            for (int b = 0; b < block; ++b) {
+                out[(size_t)(r0 + b) * out_features + o] = acc[b];
+            }
         }
     }
 }
 
+/* Split into three loops, one per output, rather than one fused loop.
+ *
+ * The fused version walks rows on the outside, which forces the whole weight
+ * matrix and the whole weight-gradient matrix through cache on every row. Split
+ * apart, each loop can be blocked for the array it actually writes.
+ *
+ * Splitting does not change any summation order, which is what makes it safe:
+ * dx[r][i] still accumulates over o ascending, and dweight[o][i] and dbias[o]
+ * still accumulate over r ascending, exactly as when the loops were nested. */
 void linear_backward(float *dx, float *dweight, float *dbias,
                      const float *dout, const float *x, const float *weight,
                      int rows, int in_features, int out_features)
 {
-    /* y[r][o] = sum_i x[r][i] * W[o][i] + b[o], so
-     *     dx[r][i] = sum_o dy[r][o] * W[o][i]
-     *     dW[o][i] = sum_r dy[r][o] * x[r][i]
-     *     db[o]    = sum_r dy[r][o]
-     *
-     * The two loops are separated by which output they write, not by which
-     * input they read, so neither needs a temporary. */
-    for (int r = 0; r < rows; ++r) {
-        const float *doutr = dout + (size_t)r * out_features;
-        const float *xr = x + (size_t)r * in_features;
-        float *dxr = dx ? dx + (size_t)r * in_features : NULL;
+    /* dx[r][i] = sum_o dy[r][o] * W[o][i]. Blocked over rows for the same
+     * reason as the forward pass: one weight row serves ROW_BLOCK outputs. */
+    if (dx) {
+        for (int r0 = 0; r0 < rows; r0 += ROW_BLOCK) {
+            int block = rows - r0 < ROW_BLOCK ? rows - r0 : ROW_BLOCK;
 
-        for (int o = 0; o < out_features; ++o) {
-            float g = doutr[o];
-            const float *wo = weight + (size_t)o * in_features;
+            for (int o = 0; o < out_features; ++o) {
+                const float *wo = weight + (size_t)o * in_features;
 
-            if (dxr) {
-                for (int i = 0; i < in_features; ++i) {
-                    dxr[i] += g * wo[i];
+                for (int b = 0; b < block; ++b) {
+                    float g = dout[(size_t)(r0 + b) * out_features + o];
+                    float *dxr = dx + (size_t)(r0 + b) * in_features;
+                    for (int i = 0; i < in_features; ++i) {
+                        dxr[i] += g * wo[i];
+                    }
                 }
             }
-            if (dweight) {
-                float *dwo = dweight + (size_t)o * in_features;
-                for (int i = 0; i < in_features; ++i) {
-                    dwo[i] += g * xr[i];
+        }
+    }
+
+    /* dW[o][i] = sum_r dy[r][o] * x[r][i]. Blocked over outputs: OUT_BLOCK rows
+     * of the gradient stay resident while the inputs stream past once, rather
+     * than the inputs streaming once per output. */
+    if (dweight) {
+        for (int o0 = 0; o0 < out_features; o0 += OUT_BLOCK) {
+            int block = out_features - o0 < OUT_BLOCK ? out_features - o0 : OUT_BLOCK;
+
+            for (int r = 0; r < rows; ++r) {
+                const float *xr = x + (size_t)r * in_features;
+                const float *doutr = dout + (size_t)r * out_features;
+
+                for (int b = 0; b < block; ++b) {
+                    float g = doutr[o0 + b];
+                    float *dwo = dweight + (size_t)(o0 + b) * in_features;
+                    for (int i = 0; i < in_features; ++i) {
+                        dwo[i] += g * xr[i];
+                    }
                 }
             }
-            if (dbias) {
-                dbias[o] += g;
+        }
+    }
+
+    /* db[o] = sum_r dy[r][o]. */
+    if (dbias) {
+        for (int r = 0; r < rows; ++r) {
+            const float *doutr = dout + (size_t)r * out_features;
+            for (int o = 0; o < out_features; ++o) {
+                dbias[o] += doutr[o];
             }
         }
     }

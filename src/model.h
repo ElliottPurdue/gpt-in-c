@@ -119,11 +119,31 @@ void gpt_randomize(gpt_model *model, unsigned seed);
  * return value is 0; logits are still written. idx and targets are (B, T). */
 float gpt_forward(gpt_model *model, const int *idx, const int *targets, int T);
 
+/* Forward over fewer rows than the model was allocated for. The activation
+ * buffers are sized by the maximum batch, and every stride is computed from the
+ * batch actually passed, so a smaller one simply uses less of them. Generation
+ * needs this: it runs one sequence at a time. */
+float gpt_forward_batch(gpt_model *model, const int *idx, const int *targets,
+                        int B, int T);
+
 /* Backward pass. Must follow a gpt_forward with the same inputs, whose saved
  * activations it reads. Gradients accumulate into model->grads, so call
  * gpt_zero_grad first unless deliberately accumulating across microbatches. */
 void gpt_backward(gpt_model *model, const int *idx, const int *targets, int T);
 
 void gpt_zero_grad(gpt_model *model);
+
+/* Autoregressive sampling. Writes prompt_len + max_new tokens into out and
+ * returns the count.
+ *
+ * Context is truncated to the last block_size tokens, because the position
+ * embedding has no entry beyond that -- the model cannot represent a longer
+ * sequence, and indexing past the table would read whatever follows it.
+ *
+ * temperature divides the logits before the softmax: below 1 it sharpens the
+ * distribution toward the argmax, above 1 flattens it. At exactly 0 it would
+ * divide by zero, so that case takes the argmax directly. */
+int gpt_generate(gpt_model *model, const int *prompt, int prompt_len,
+                 int *out, int max_new, float temperature, unsigned *rng);
 
 #endif /* MODEL_H */

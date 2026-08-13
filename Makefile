@@ -16,12 +16,12 @@ endif
 CFLAGS  = -std=c99 -O2 -Wall -Wextra -Werror -pedantic -msse2 -mfpmath=sse
 LDFLAGS = -lm
 
-SRC   = src/tensor.c src/ops.c src/model.c src/optim.c
-TESTS = tests/main.c tests/oracle.c tests/test_ops.c tests/test_model.c tests/test_optim.c
+SRC   = src/tensor.c src/ops.c src/model.c src/optim.c src/tokenizer.c
+TESTS = tests/main.c tests/oracle.c tests/test_ops.c tests/test_model.c tests/test_optim.c tests/test_tokenizer.c
 
 PYTHON ?= python
 
-.PHONY: all test oracle clean
+.PHONY: all test oracle train clean
 
 all: test
 
@@ -39,6 +39,21 @@ build/run_tests: $(SRC) $(TESTS) | build
 
 build:
 	mkdir -p build
+
+train: build/train data/input.txt
+	./build/train data/input.txt 500
+
+build/train: $(SRC) train.c | build
+	$(CC) $(CFLAGS) $(SRC) train.c -o $@ $(LDFLAGS)
+
+# The corpus is the project's own source and prose, concatenated. Using the repo
+# itself keeps the training data reproducible and the build free of downloads,
+# and a character model has plenty to learn from C syntax: matched braces,
+# indentation, comment delimiters, identifier conventions.
+data/input.txt: $(wildcard src/*.c src/*.h tests/*.c ref/*.py) README.md
+	mkdir -p data
+	cat src/*.c src/*.h tests/*.c tests/*.h ref/*.py train.c README.md > $@
+	@wc -c < $@ | xargs echo "  corpus bytes:"
 
 clean:
 	rm -rf build

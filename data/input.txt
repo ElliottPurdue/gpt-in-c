@@ -1,0 +1,3827 @@
+#include "model.h"
+#include "ops.h"
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Walks the parameter layout once. Called twice: with base == NULL to total the
+ * sizes, and again with a real base to assign the pointers. Keeping both uses in
+ * one function is what guarantees the count and the layout cannot disagree --
+ * two separate versions would drift the first time a parameter was added. */
+static size_t map_params(gpt_params *p, gpt_config c, float *base)
+{
+    size_t offset = 0;
+    int C = c.n_embd, L = c.n_layer;
+
+#define FIELD(name, n) do {                                                   \
+        if (p) { p->name = base ? base + offset : NULL; }                     \
+        offset += (size_t)(n);                                                \
+    } while (0)
+
+    FIELD(wte, (size_t)c.vocab_size * C);
+    FIELD(wpe, (size_t)c.block_size * C);
+
+    FIELD(ln1_w, (size_t)L * C);
+    FIELD(ln1_b, (size_t)L * C);
+    FIELD(qkv_w, (size_t)L * 3 * C * C);
+    FIELD(qkv_b, (size_t)L * 3 * C);
+    FIELD(proj_w, (size_t)L * C * C);
+    FIELD(proj_b, (size_t)L * C);
+    FIELD(ln2_w, (size_t)L * C);
+    FIELD(ln2_b, (size_t)L * C);
+    FIELD(fc_w, (size_t)L * 4 * C * C);
+    FIELD(fc_b, (size_t)L * 4 * C);
+    FIELD(fcproj_w, (size_t)L * C * 4 * C);
+    FIELD(fcproj_b, (size_t)L * C);
+
+    FIELD(lnf_w, (size_t)C);
+    FIELD(lnf_b, (size_t)C);
+    FIELD(lm_head, (size_t)c.vocab_size * C);
+
+#undef FIELD
+    return offset;
+}
+
+static size_t map_acts(gpt_activations *a, gpt_config c, int B, float *base)
+{
+    size_t offset = 0;
+    int C = c.n_embd, L = c.n_layer, T = c.block_size, H = c.n_head;
+    size_t BTC = (size_t)B * T * C;
+    size_t BT = (size_t)B * T;
+
+#define FIELD(name, n) do {                                                   \
+        if (a) { a->name = base ? base + offset : NULL; }                     \
+        offset += (size_t)(n);                                                \
+    } while (0)
+
+    FIELD(embedded, BTC);
+
+    FIELD(ln1, (size_t)L * BTC);
+    FIELD(ln1_mean, (size_t)L * BT);
+    FIELD(ln1_rstd, (size_t)L * BT);
+    FIELD(qkv, (size_t)L * B * T * 3 * C);
+    FIELD(att, (size_t)L * B * H * T * T);
+    FIELD(attn_out, (size_t)L * BTC);
+    FIELD(attn_proj, (size_t)L * BTC);
+    FIELD(residual1, (size_t)L * BTC);
+
+    FIELD(ln2, (size_t)L * BTC);
+    FIELD(ln2_mean, (size_t)L * BT);
+    FIELD(ln2_rstd, (size_t)L * BT);
+    FIELD(fc, (size_t)L * B * T * 4 * C);
+    FIELD(gelu, (size_t)L * B * T * 4 * C);
+    FIELD(mlp_out, (size_t)L * BTC);
+    FIELD(residual2, (size_t)L * BTC);
+
+    FIELD(lnf, BTC);
+    FIELD(lnf_mean, BT);
+    FIELD(lnf_rstd, BT);
+    FIELD(logits, (size_t)B * T * c.vocab_size);
+    FIELD(probs, (size_t)B * T * c.vocab_size);
+
+#undef FIELD
+    return offset;
+}
+
+size_t gpt_parameter_count(gpt_config config)
+{
+    return map_params(NULL, config, NULL);
+}
+
+/* The backward pass needs a gradient buffer for most activation shapes. Rather
+ * than mirroring the activation struct, it takes slices off one workspace as it
+ * goes -- the gradients flow layer by layer and only a few are live at once. */
+static size_t workspace_size(gpt_config c, int B)
+{
+    size_t C = (size_t)c.n_embd, T = (size_t)c.block_size;
+    size_t BTC = (size_t)B * T * C;
+    size_t largest_logits = (size_t)B * T * c.vocab_size;
+
+    /* Ten (B,T,C) buffers for the residual stream and block internals, one
+     * (B,T,3C) for qkv, two (B,T,4C) for the MLP, one attention map, and the
+     * logits. Sized generously and asserted by use rather than tuned. */
+    return 10 * BTC + (size_t)B * T * 3 * C + 2 * (size_t)B * T * 4 * C
+         + (size_t)B * c.n_head * T * T + largest_logits;
+}
+
+int gpt_init(gpt_model *model, gpt_config config, int batch)
+{
+    memset(model, 0, sizeof(*model));
+    model->config = config;
+
+    size_t n_params = map_params(NULL, config, NULL);
+    size_t n_acts = map_acts(NULL, config, batch, NULL);
+    size_t n_work = workspace_size(config, batch);
+
+    model->params.storage = (float *)calloc(n_params, sizeof(float));
+    model->grads.storage = (float *)calloc(n_params, sizeof(float));
+    model->acts.storage = (float *)calloc(n_acts, sizeof(float));
+    model->workspace.storage = (float *)calloc(n_work, sizeof(float));
+
+    if (!model->params.storage || !model->grads.storage ||
+        !model->acts.storage || !model->workspace.storage) {
+        gpt_free(model);
+        return 0;
+    }
+
+    map_params(&model->params, config, model->params.storage);
+    map_params(&model->grads, config, model->grads.storage);
+    map_acts(&model->acts, config, batch, model->acts.storage);
+
+    model->params.count = n_params;
+    model->grads.count = n_params;
+    model->acts.count = n_acts;
+    model->acts.batch = batch;
+    model->workspace.count = n_work;
+    model->workspace.batch = batch;
+    return 1;
+}
+
+void gpt_free(gpt_model *model)
+{
+    free(model->params.storage);
+    free(model->grads.storage);
+    free(model->acts.storage);
+    free(model->workspace.storage);
+    memset(model, 0, sizeof(*model));
+}
+
+void gpt_zero_grad(gpt_model *model)
+{
+    memset(model->grads.storage, 0, model->grads.count * sizeof(float));
+}
+
+/* xorshift, so initialisation is reproducible without depending on the host's
+ * rand() or on a seeded global. */
+static unsigned next_random(unsigned *state)
+{
+    unsigned x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+static float normal(unsigned *state)
+{
+    /* Box-Muller. Both uniforms are pushed strictly inside (0, 1): u1 at exactly
+     * zero makes log() infinite, and a value at or above 1 makes it positive,
+     * which puts a negative argument into sqrt and yields NaN. */
+    float u1 = ((float)(next_random(state) >> 8) + 0.5f) / 16777216.0f;
+    float u2 = ((float)(next_random(state) >> 8) + 0.5f) / 16777216.0f;
+    return sqrtf(-2.0f * logf(u1)) * cosf(6.283185307179586f * u2);
+}
+
+void gpt_randomize(gpt_model *model, unsigned seed)
+{
+    unsigned state = seed ? seed : 1u;
+    gpt_config c = model->config;
+    gpt_params *p = &model->params;
+
+    memset(p->storage, 0, p->count * sizeof(float));
+
+    /* 0.02 is the GPT-2 initialisation. The scale matters more than it looks:
+     * too large and the first softmax saturates, too small and the residual
+     * stream carries no signal for the early layers to work with. */
+    const float sigma = 0.02f;
+    size_t weights[] = {
+        (size_t)c.vocab_size * c.n_embd,        /* wte */
+        (size_t)c.block_size * c.n_embd,        /* wpe */
+    };
+    float *targets[] = { p->wte, p->wpe };
+    for (int i = 0; i < 2; ++i) {
+        for (size_t j = 0; j < weights[i]; ++j) {
+            targets[i][j] = sigma * normal(&state);
+        }
+    }
+
+    int C = c.n_embd, L = c.n_layer;
+    for (int l = 0; l < L; ++l) {
+        /* LayerNorm starts as the identity: unit gain, zero shift. */
+        for (int i = 0; i < C; ++i) {
+            p->ln1_w[l * C + i] = 1.0f;
+            p->ln2_w[l * C + i] = 1.0f;
+        }
+        for (size_t i = 0; i < (size_t)3 * C * C; ++i) {
+            p->qkv_w[(size_t)l * 3 * C * C + i] = sigma * normal(&state);
+        }
+        for (size_t i = 0; i < (size_t)C * C; ++i) {
+            p->proj_w[(size_t)l * C * C + i] = sigma * normal(&state);
+        }
+        for (size_t i = 0; i < (size_t)4 * C * C; ++i) {
+            p->fc_w[(size_t)l * 4 * C * C + i] = sigma * normal(&state);
+            p->fcproj_w[(size_t)l * 4 * C * C + i] = sigma * normal(&state);
+        }
+    }
+    for (int i = 0; i < C; ++i) {
+        p->lnf_w[i] = 1.0f;
+    }
+    for (size_t i = 0; i < (size_t)c.vocab_size * C; ++i) {
+        p->lm_head[i] = sigma * normal(&state);
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * Forward
+ * ------------------------------------------------------------------------ */
+
+float gpt_forward(gpt_model *model, const int *idx, const int *targets, int T)
+{
+    return gpt_forward_batch(model, idx, targets, model->acts.batch, T);
+}
+
+float gpt_forward_batch(gpt_model *model, const int *idx, const int *targets,
+                        int B, int T)
+{
+    gpt_config c = model->config;
+    gpt_params *p = &model->params;
+    gpt_activations *a = &model->acts;
+
+    int C = c.n_embd, L = c.n_layer, H = c.n_head, V = c.vocab_size;
+    size_t BTC = (size_t)B * T * C;
+    size_t BT = (size_t)B * T;
+
+    /* Token plus position. The position embedding is indexed by offset within
+     * the sequence, not by token identity, which is the only thing giving the
+     * model any notion of order -- attention itself is permutation invariant. */
+    for (int b = 0; b < B; ++b) {
+        for (int t = 0; t < T; ++t) {
+            const float *token = p->wte + (size_t)idx[b * T + t] * C;
+            const float *position = p->wpe + (size_t)t * C;
+            float *out = a->embedded + ((size_t)b * T + t) * C;
+            for (int i = 0; i < C; ++i) {
+                out[i] = token[i] + position[i];
+            }
+        }
+    }
+
+    const float *residual = a->embedded;
+
+    for (int l = 0; l < L; ++l) {
+        float *ln1 = a->ln1 + (size_t)l * BTC;
+        float *ln1_mean = a->ln1_mean + (size_t)l * BT;
+        float *ln1_rstd = a->ln1_rstd + (size_t)l * BT;
+        float *qkv = a->qkv + (size_t)l * B * T * 3 * C;
+        float *att = a->att + (size_t)l * B * H * T * T;
+        float *attn_out = a->attn_out + (size_t)l * BTC;
+        float *attn_proj = a->attn_proj + (size_t)l * BTC;
+        float *residual1 = a->residual1 + (size_t)l * BTC;
+        float *ln2 = a->ln2 + (size_t)l * BTC;
+        float *ln2_mean = a->ln2_mean + (size_t)l * BT;
+        float *ln2_rstd = a->ln2_rstd + (size_t)l * BT;
+        float *fc = a->fc + (size_t)l * B * T * 4 * C;
+        float *gelu = a->gelu + (size_t)l * B * T * 4 * C;
+        float *mlp_out = a->mlp_out + (size_t)l * BTC;
+        float *residual2 = a->residual2 + (size_t)l * BTC;
+
+        /* Pre-norm: normalise going into the sublayer, and add the raw residual
+         * afterwards. Post-norm normalises the sum instead, which puts a
+         * LayerNorm on the residual path and makes deep stacks need a warmup to
+         * train at all. */
+        layernorm_forward(ln1, ln1_mean, ln1_rstd, residual,
+                          p->ln1_w + (size_t)l * C, p->ln1_b + (size_t)l * C,
+                          B * T, C, 1e-5f);
+
+        attention_forward(attn_out, qkv, att, ln1,
+                          p->qkv_w + (size_t)l * 3 * C * C,
+                          p->qkv_b + (size_t)l * 3 * C, B, T, C, H);
+
+        linear_forward(attn_proj, attn_out, p->proj_w + (size_t)l * C * C,
+                       p->proj_b + (size_t)l * C, B * T, C, C);
+
+        for (size_t i = 0; i < BTC; ++i) {
+            residual1[i] = residual[i] + attn_proj[i];
+        }
+
+        layernorm_forward(ln2, ln2_mean, ln2_rstd, residual1,
+                          p->ln2_w + (size_t)l * C, p->ln2_b + (size_t)l * C,
+                          B * T, C, 1e-5f);
+
+        linear_forward(fc, ln2, p->fc_w + (size_t)l * 4 * C * C,
+                       p->fc_b + (size_t)l * 4 * C, B * T, C, 4 * C);
+        gelu_forward(gelu, fc, (int)((size_t)B * T * 4 * C));
+        linear_forward(mlp_out, gelu, p->fcproj_w + (size_t)l * C * 4 * C,
+                       p->fcproj_b + (size_t)l * C, B * T, 4 * C, C);
+
+        for (size_t i = 0; i < BTC; ++i) {
+            residual2[i] = residual1[i] + mlp_out[i];
+        }
+
+        residual = residual2;
+    }
+
+    layernorm_forward(a->lnf, a->lnf_mean, a->lnf_rstd, residual,
+                      p->lnf_w, p->lnf_b, B * T, C, 1e-5f);
+
+    linear_forward(a->logits, a->lnf, p->lm_head, NULL, B * T, C, V);
+
+    if (!targets) {
+        return 0.0f;
+    }
+    return crossentropy_forward(a->probs, a->logits, targets, B * T, V);
+}
+
+/* ------------------------------------------------------------------------
+ * Backward
+ * ------------------------------------------------------------------------ */
+
+void gpt_backward(gpt_model *model, const int *idx, const int *targets, int T)
+{
+    gpt_config c = model->config;
+    gpt_params *p = &model->params;
+    gpt_params *g = &model->grads;
+    gpt_activations *a = &model->acts;
+
+    int B = a->batch, C = c.n_embd, L = c.n_layer, H = c.n_head, V = c.vocab_size;
+    size_t BTC = (size_t)B * T * C;
+    size_t BT4C = (size_t)B * T * 4 * C;
+
+    /* Slice the workspace. The gradients flow one layer at a time, so these are
+     * reused across layers rather than being kept per layer. */
+    float *cursor = model->workspace.storage;
+    float *dresidual = cursor;   cursor += BTC;   /* into the block */
+    float *dresidual1 = cursor;  cursor += BTC;
+    float *dresidual2 = cursor;  cursor += BTC;
+    float *dln1 = cursor;        cursor += BTC;
+    float *dln2 = cursor;        cursor += BTC;
+    float *dattn_out = cursor;   cursor += BTC;
+    float *dattn_proj = cursor;  cursor += BTC;
+    float *dmlp_out = cursor;    cursor += BTC;
+    float *dlnf = cursor;        cursor += BTC;
+    float *dembedded = cursor;   cursor += BTC;
+    float *dqkv = cursor;        cursor += (size_t)B * T * 3 * C;
+    float *dfc = cursor;         cursor += BT4C;
+    float *dgelu = cursor;       cursor += BT4C;
+    float *datt = cursor;        cursor += (size_t)B * H * T * T;
+    float *dlogits = cursor;
+
+    memset(model->workspace.storage, 0,
+           model->workspace.count * sizeof(float));
+
+    crossentropy_backward(dlogits, a->probs, targets, B * T, V);
+
+    /* lm_head has no bias, hence the NULL. */
+    linear_backward(dlnf, g->lm_head, NULL, dlogits, a->lnf, p->lm_head,
+                    B * T, C, V);
+
+    const float *last = (L > 0) ? a->residual2 + (size_t)(L - 1) * BTC
+                                : a->embedded;
+    layernorm_backward(dresidual, g->lnf_w, g->lnf_b, dlnf, last,
+                       a->lnf_mean, a->lnf_rstd, p->lnf_w, B * T, C);
+
+    for (int l = L - 1; l >= 0; --l) {
+        const float *ln1 = a->ln1 + (size_t)l * BTC;
+        const float *qkv = a->qkv + (size_t)l * B * T * 3 * C;
+        const float *att = a->att + (size_t)l * B * H * T * T;
+        const float *attn_out = a->attn_out + (size_t)l * BTC;
+        const float *residual1 = a->residual1 + (size_t)l * BTC;
+        const float *ln2 = a->ln2 + (size_t)l * BTC;
+        const float *gelu = a->gelu + (size_t)l * B * T * 4 * C;
+        const float *fc = a->fc + (size_t)l * B * T * 4 * C;
+        const float *block_input = (l > 0) ? a->residual2 + (size_t)(l - 1) * BTC
+                                           : a->embedded;
+
+        /* dresidual holds the gradient arriving at this block's output. The
+         * residual connection is an addition, so it forwards that gradient
+         * unchanged down both paths -- which is exactly why residual networks
+         * train: the identity path carries gradient to every depth without
+         * being attenuated by any weight matrix. */
+        memcpy(dresidual2, dresidual, BTC * sizeof(float));
+        memcpy(dmlp_out, dresidual, BTC * sizeof(float));
+
+        memset(dgelu, 0, BT4C * sizeof(float));
+        linear_backward(dgelu, g->fcproj_w + (size_t)l * C * 4 * C,
+                        g->fcproj_b + (size_t)l * C, dmlp_out, gelu,
+                        p->fcproj_w + (size_t)l * C * 4 * C,
+                        B * T, 4 * C, C);
+
+        memset(dfc, 0, BT4C * sizeof(float));
+        gelu_backward(dfc, dgelu, fc, (int)BT4C);
+
+        memset(dln2, 0, BTC * sizeof(float));
+        linear_backward(dln2, g->fc_w + (size_t)l * 4 * C * C,
+                        g->fc_b + (size_t)l * 4 * C, dfc, ln2,
+                        p->fc_w + (size_t)l * 4 * C * C, B * T, C, 4 * C);
+
+        /* The residual's other branch: dresidual2 is the gradient that skipped
+         * the MLP entirely, and the LayerNorm's contribution adds to it. */
+        memcpy(dresidual1, dresidual2, BTC * sizeof(float));
+        layernorm_backward(dresidual1, g->ln2_w + (size_t)l * C,
+                           g->ln2_b + (size_t)l * C, dln2, residual1,
+                           a->ln2_mean + (size_t)l * B * T,
+                           a->ln2_rstd + (size_t)l * B * T,
+                           p->ln2_w + (size_t)l * C, B * T, C);
+
+        memcpy(dattn_proj, dresidual1, BTC * sizeof(float));
+
+        memset(dattn_out, 0, BTC * sizeof(float));
+        linear_backward(dattn_out, g->proj_w + (size_t)l * C * C,
+                        g->proj_b + (size_t)l * C, dattn_proj, attn_out,
+                        p->proj_w + (size_t)l * C * C, B * T, C, C);
+
+        memset(dln1, 0, BTC * sizeof(float));
+        memset(dqkv, 0, (size_t)B * T * 3 * C * sizeof(float));
+        memset(datt, 0, (size_t)B * H * T * T * sizeof(float));
+        attention_backward(dln1, g->qkv_w + (size_t)l * 3 * C * C,
+                           g->qkv_b + (size_t)l * 3 * C, dqkv, datt,
+                           dattn_out, ln1, p->qkv_w + (size_t)l * 3 * C * C,
+                           qkv, att, B, T, C, H);
+
+        /* And the attention branch's residual, feeding the next iteration. */
+        memcpy(dresidual, dresidual1, BTC * sizeof(float));
+        layernorm_backward(dresidual, g->ln1_w + (size_t)l * C,
+                           g->ln1_b + (size_t)l * C, dln1, block_input,
+                           a->ln1_mean + (size_t)l * B * T,
+                           a->ln1_rstd + (size_t)l * B * T,
+                           p->ln1_w + (size_t)l * C, B * T, C);
+    }
+
+    memcpy(dembedded, dresidual, BTC * sizeof(float));
+
+    /* Embeddings are a gather forward, so their gradient is a scatter-add. Every
+     * occurrence of a token accumulates into the same row, which is the clearest
+     * case for why these functions add rather than assign. */
+    for (int b = 0; b < B; ++b) {
+        for (int t = 0; t < T; ++t) {
+            const float *d = dembedded + ((size_t)b * T + t) * C;
+            float *dtoken = g->wte + (size_t)idx[b * T + t] * C;
+            float *dposition = g->wpe + (size_t)t * C;
+            for (int i = 0; i < C; ++i) {
+                dtoken[i] += d[i];
+                dposition[i] += d[i];
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * Sampling
+ * ------------------------------------------------------------------------ */
+
+int gpt_generate(gpt_model *model, const int *prompt, int prompt_len,
+                 int *out, int max_new, float temperature, unsigned *rng)
+{
+    gpt_config c = model->config;
+    int V = c.vocab_size, T_max = c.block_size;
+
+    int count = prompt_len < T_max ? prompt_len : T_max;
+    for (int i = 0; i < count; ++i) {
+        out[i] = prompt[i];
+    }
+
+    for (int step = 0; step < max_new; ++step) {
+        /* Only the trailing block_size tokens are visible. This is a real
+         * limitation of the model rather than an implementation shortcut: the
+         * position embedding table has exactly block_size rows. */
+        int start = count > T_max ? count - T_max : 0;
+        int window = count - start;
+
+        gpt_forward_batch(model, out + start, NULL, 1, window);
+
+        /* Only the last position predicts the next token; the earlier ones
+         * predict tokens already present. */
+        const float *logits = model->acts.logits + (size_t)(window - 1) * V;
+
+        int next = 0;
+        if (temperature <= 0.0f) {
+            for (int v = 1; v < V; ++v) {
+                if (logits[v] > logits[next]) {
+                    next = v;
+                }
+            }
+        } else {
+            /* Softmax over the scaled logits, with the usual max subtraction,
+             * then an inverse-CDF draw. */
+            float maximum = logits[0];
+            for (int v = 1; v < V; ++v) {
+                if (logits[v] > maximum) {
+                    maximum = logits[v];
+                }
+            }
+
+            float sum = 0.0f;
+            for (int v = 0; v < V; ++v) {
+                sum += expf((logits[v] - maximum) / temperature);
+            }
+
+            *rng = *rng * 1103515245u + 12345u;
+            float target = ((float)((*rng >> 16) & 0x7fff) / 32768.0f) * sum;
+
+            float running = 0.0f;
+            next = V - 1;   /* fallback if rounding leaves target just above sum */
+            for (int v = 0; v < V; ++v) {
+                running += expf((logits[v] - maximum) / temperature);
+                if (running >= target) {
+                    next = v;
+                    break;
+                }
+            }
+        }
+
+        out[count++] = next;
+    }
+    return count;
+}
+#include "ops.h"
+
+#include <math.h>
+#include <string.h>
+
+/* ------------------------------------------------------------------------
+ * Linear
+ * ------------------------------------------------------------------------ */
+
+void linear_forward(float *out, const float *x, const float *weight,
+                    const float *bias, int rows, int in_features,
+                    int out_features)
+{
+    for (int r = 0; r < rows; ++r) {
+        const float *xr = x + (size_t)r * in_features;
+        float *outr = out + (size_t)r * out_features;
+
+        for (int o = 0; o < out_features; ++o) {
+            const float *wo = weight + (size_t)o * in_features;
+            float sum = bias ? bias[o] : 0.0f;
+            for (int i = 0; i < in_features; ++i) {
+                sum += xr[i] * wo[i];
+            }
+            outr[o] = sum;
+        }
+    }
+}
+
+void linear_backward(float *dx, float *dweight, float *dbias,
+                     const float *dout, const float *x, const float *weight,
+                     int rows, int in_features, int out_features)
+{
+    /* y[r][o] = sum_i x[r][i] * W[o][i] + b[o], so
+     *     dx[r][i] = sum_o dy[r][o] * W[o][i]
+     *     dW[o][i] = sum_r dy[r][o] * x[r][i]
+     *     db[o]    = sum_r dy[r][o]
+     *
+     * The two loops are separated by which output they write, not by which
+     * input they read, so neither needs a temporary. */
+    for (int r = 0; r < rows; ++r) {
+        const float *doutr = dout + (size_t)r * out_features;
+        const float *xr = x + (size_t)r * in_features;
+        float *dxr = dx ? dx + (size_t)r * in_features : NULL;
+
+        for (int o = 0; o < out_features; ++o) {
+            float g = doutr[o];
+            const float *wo = weight + (size_t)o * in_features;
+
+            if (dxr) {
+                for (int i = 0; i < in_features; ++i) {
+                    dxr[i] += g * wo[i];
+                }
+            }
+            if (dweight) {
+                float *dwo = dweight + (size_t)o * in_features;
+                for (int i = 0; i < in_features; ++i) {
+                    dwo[i] += g * xr[i];
+                }
+            }
+            if (dbias) {
+                dbias[o] += g;
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * LayerNorm
+ * ------------------------------------------------------------------------ */
+
+void layernorm_forward(float *out, float *mean, float *rstd, const float *x,
+                       const float *weight, const float *bias,
+                       int rows, int cols, float eps)
+{
+    for (int r = 0; r < rows; ++r) {
+        const float *xr = x + (size_t)r * cols;
+
+        float sum = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            sum += xr[c];
+        }
+        float m = sum / (float)cols;
+
+        /* Variance from the centred values rather than E[x^2] - E[x]^2. The
+         * latter is one pass cheaper and subtracts two large nearly-equal
+         * numbers, losing most of the significand when the mean is large
+         * relative to the spread. */
+        float variance = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            float d = xr[c] - m;
+            variance += d * d;
+        }
+        variance /= (float)cols;
+
+        float inv = 1.0f / sqrtf(variance + eps);
+        mean[r] = m;
+        rstd[r] = inv;
+
+        float *outr = out + (size_t)r * cols;
+        for (int c = 0; c < cols; ++c) {
+            float normalized = (xr[c] - m) * inv;
+            outr[c] = normalized * weight[c] + bias[c];
+        }
+    }
+}
+
+void layernorm_backward(float *dx, float *dweight, float *dbias,
+                        const float *dout, const float *x, const float *mean,
+                        const float *rstd, const float *weight,
+                        int rows, int cols)
+{
+    /* With n = cols, xhat = (x - mean) * rstd and g = dout * weight:
+     *
+     *     dx = rstd * (g - mean(g) - xhat * mean(g * xhat))
+     *
+     * The two mean terms are what makes this different from a plain scale, and
+     * they are what a careless derivation drops. They exist because mean and
+     * variance are themselves functions of every element of the row: changing
+     * one input moves the statistics, which moves every other output. Dropping
+     * them still trains -- slightly worse -- which is why this needs a test
+     * rather than a look. */
+    for (int r = 0; r < rows; ++r) {
+        const float *xr = x + (size_t)r * cols;
+        const float *doutr = dout + (size_t)r * cols;
+        float m = mean[r], inv = rstd[r];
+
+        float mean_g = 0.0f;         /* mean over the row of dout*weight */
+        float mean_g_xhat = 0.0f;    /* mean over the row of dout*weight*xhat */
+
+        for (int c = 0; c < cols; ++c) {
+            float xhat = (xr[c] - m) * inv;
+            float g = doutr[c] * weight[c];
+            mean_g += g;
+            mean_g_xhat += g * xhat;
+
+            if (dweight) {
+                dweight[c] += doutr[c] * xhat;
+            }
+            if (dbias) {
+                dbias[c] += doutr[c];
+            }
+        }
+        mean_g /= (float)cols;
+        mean_g_xhat /= (float)cols;
+
+        if (dx) {
+            float *dxr = dx + (size_t)r * cols;
+            for (int c = 0; c < cols; ++c) {
+                float xhat = (xr[c] - m) * inv;
+                float g = doutr[c] * weight[c];
+                dxr[c] += inv * (g - mean_g - xhat * mean_g_xhat);
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * GELU
+ * ------------------------------------------------------------------------ */
+
+#define SQRT_1_2  0.70710678118654752440f   /* 1/sqrt(2) */
+#define SQRT_2_PI 0.79788456080286535588f   /* sqrt(2/pi) */
+
+void gelu_forward(float *out, const float *x, int n)
+{
+    for (int i = 0; i < n; ++i) {
+        out[i] = 0.5f * x[i] * (1.0f + erff(x[i] * SQRT_1_2));
+    }
+}
+
+void gelu_backward(float *dx, const float *dout, const float *x, int n)
+{
+    /* d/dx [0.5x(1 + erf(x/sqrt2))] = 0.5(1 + erf(x/sqrt2)) + x * phi(x)
+     * where phi is the standard normal density. The second term is the one
+     * that distinguishes GELU's gradient from a gated linear unit's. */
+    for (int i = 0; i < n; ++i) {
+        float v = x[i];
+        float cdf = 0.5f * (1.0f + erff(v * SQRT_1_2));
+        float pdf = 0.5f * SQRT_2_PI * expf(-0.5f * v * v);
+        dx[i] += dout[i] * (cdf + v * pdf);
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * Softmax
+ * ------------------------------------------------------------------------ */
+
+void softmax_forward(float *out, const float *x, int rows, int cols)
+{
+    for (int r = 0; r < rows; ++r) {
+        const float *xr = x + (size_t)r * cols;
+        float *outr = out + (size_t)r * cols;
+
+        /* Subtracting the row maximum is mathematically a no-op and numerically
+         * essential: attention logits routinely exceed 88, where expf overflows
+         * to infinity in float32 and the row becomes NaN. */
+        float maximum = xr[0];
+        for (int c = 1; c < cols; ++c) {
+            if (xr[c] > maximum) {
+                maximum = xr[c];
+            }
+        }
+
+        float sum = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            float e = expf(xr[c] - maximum);
+            outr[c] = e;
+            sum += e;
+        }
+
+        float inv = 1.0f / sum;
+        for (int c = 0; c < cols; ++c) {
+            outr[c] *= inv;
+        }
+    }
+}
+
+void softmax_backward(float *dx, const float *dout, const float *out,
+                      int rows, int cols)
+{
+    for (int r = 0; r < rows; ++r) {
+        const float *doutr = dout + (size_t)r * cols;
+        const float *outr = out + (size_t)r * cols;
+        float *dxr = dx + (size_t)r * cols;
+
+        float dot = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            dot += doutr[c] * outr[c];
+        }
+        for (int c = 0; c < cols; ++c) {
+            dxr[c] += outr[c] * (doutr[c] - dot);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * Cross entropy
+ * ------------------------------------------------------------------------ */
+
+float crossentropy_forward(float *probs, const float *logits,
+                           const int *targets, int rows, int classes)
+{
+    softmax_forward(probs, logits, rows, classes);
+
+    float total = 0.0f;
+    for (int r = 0; r < rows; ++r) {
+        float p = probs[(size_t)r * classes + targets[r]];
+
+        /* The floor matters: a confident wrong prediction drives p to zero and
+         * logf(0) is -inf, which poisons the mean and every gradient computed
+         * from it. Clamping bounds one sample's contribution at ~30 instead. */
+        if (p < 1e-13f) {
+            p = 1e-13f;
+        }
+        total += -logf(p);
+    }
+    return total / (float)rows;
+}
+
+void crossentropy_backward(float *dlogits, const float *probs,
+                           const int *targets, int rows, int classes)
+{
+    /* The softmax and the log cancel: d(loss)/d(logits) = (p - onehot) / rows.
+     * Computed separately, the log's 1/p and the softmax's p would multiply
+     * back to this, but only after each had been rounded. */
+    float scale = 1.0f / (float)rows;
+
+    for (int r = 0; r < rows; ++r) {
+        const float *pr = probs + (size_t)r * classes;
+        float *dr = dlogits + (size_t)r * classes;
+
+        for (int c = 0; c < classes; ++c) {
+            dr[c] += scale * pr[c];
+        }
+        dr[targets[r]] -= scale;
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * Multi-head causal self-attention
+ * ------------------------------------------------------------------------ */
+
+/* Offsets into the (B, T, 3C) projection buffer. `which` is 0 for q, 1 for k,
+ * 2 for v. Written once and used by both passes, because getting this indexing
+ * wrong in only one of them produces a gradient that is subtly incorrect rather
+ * than obviously so. */
+static size_t qkv_offset(int b, int t, int which, int head, int T, int C,
+                         int head_dim)
+{
+    return ((size_t)(b * T + t) * 3 + which) * C + (size_t)head * head_dim;
+}
+
+void attention_forward(float *out, float *qkv, float *att,
+                       const float *x, const float *qkv_w, const float *qkv_b,
+                       int B, int T, int C, int n_head)
+{
+    int head_dim = C / n_head;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    linear_forward(qkv, x, qkv_w, qkv_b, B * T, C, 3 * C);
+
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < n_head; ++h) {
+            float *att_head = att + ((size_t)b * n_head + h) * T * T;
+
+            for (int i = 0; i < T; ++i) {
+                const float *q = qkv + qkv_offset(b, i, 0, h, T, C, head_dim);
+                float *att_row = att_head + (size_t)i * T;
+
+                /* Causality is enforced by never computing the scores above the
+                 * diagonal, rather than by computing them and adding -inf. The
+                 * result is identical and it halves the work, but the entries
+                 * still have to be zeroed: the backward pass and the oracle
+                 * comparison both read the full row. */
+                float maximum = -INFINITY;
+                for (int j = 0; j <= i; ++j) {
+                    const float *k = qkv + qkv_offset(b, j, 1, h, T, C, head_dim);
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        dot += q[d] * k[d];
+                    }
+                    /* The 1/sqrt(head_dim) scale keeps the logits' variance
+                     * independent of head size. Without it softmax saturates as
+                     * the model widens and the gradients vanish. */
+                    dot *= scale;
+                    att_row[j] = dot;
+                    if (dot > maximum) {
+                        maximum = dot;
+                    }
+                }
+
+                float sum = 0.0f;
+                for (int j = 0; j <= i; ++j) {
+                    float e = expf(att_row[j] - maximum);
+                    att_row[j] = e;
+                    sum += e;
+                }
+                float inv = 1.0f / sum;
+                for (int j = 0; j <= i; ++j) {
+                    att_row[j] *= inv;
+                }
+                for (int j = i + 1; j < T; ++j) {
+                    att_row[j] = 0.0f;
+                }
+
+                /* Merge straight into the (B, T, C) output. Writing to a
+                 * (B, n_head, T, head_dim) buffer and transposing afterwards
+                 * would need a second pass over the same data. */
+                float *outi = out + ((size_t)b * T + i) * C + (size_t)h * head_dim;
+                for (int d = 0; d < head_dim; ++d) {
+                    outi[d] = 0.0f;
+                }
+                for (int j = 0; j <= i; ++j) {
+                    const float *v = qkv + qkv_offset(b, j, 2, h, T, C, head_dim);
+                    float weight = att_row[j];
+                    for (int d = 0; d < head_dim; ++d) {
+                        outi[d] += weight * v[d];
+                    }
+                }
+            }
+        }
+    }
+}
+
+void attention_backward(float *dx, float *dqkv_w, float *dqkv_b,
+                        float *dqkv, float *datt,
+                        const float *dout, const float *x, const float *qkv_w,
+                        const float *qkv, const float *att,
+                        int B, int T, int C, int n_head)
+{
+    int head_dim = C / n_head;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < n_head; ++h) {
+            const float *att_head = att + ((size_t)b * n_head + h) * T * T;
+            float *datt_head = datt + ((size_t)b * n_head + h) * T * T;
+
+            for (int i = 0; i < T; ++i) {
+                const float *att_row = att_head + (size_t)i * T;
+                float *datt_row = datt_head + (size_t)i * T;
+                const float *douti = dout + ((size_t)b * T + i) * C
+                                   + (size_t)h * head_dim;
+
+                /* y[i] = sum_j att[i][j] * v[j], so the incoming gradient splits
+                 * into one term for the weights and one for the values. */
+                for (int j = 0; j <= i; ++j) {
+                    const float *v = qkv + qkv_offset(b, j, 2, h, T, C, head_dim);
+                    float *dv = dqkv + qkv_offset(b, j, 2, h, T, C, head_dim);
+
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        dot += douti[d] * v[d];
+                        dv[d] += att_row[j] * douti[d];
+                    }
+                    datt_row[j] = dot;
+                }
+
+                /* Softmax backward, restricted to the unmasked prefix. The
+                 * masked entries need no special handling: att is zero there, so
+                 * their contribution to the row's dot product and to their own
+                 * gradient is zero either way. */
+                float dot = 0.0f;
+                for (int j = 0; j <= i; ++j) {
+                    dot += datt_row[j] * att_row[j];
+                }
+
+                float *dq = dqkv + qkv_offset(b, i, 0, h, T, C, head_dim);
+                const float *q = qkv + qkv_offset(b, i, 0, h, T, C, head_dim);
+
+                for (int j = 0; j <= i; ++j) {
+                    float dscore = att_row[j] * (datt_row[j] - dot) * scale;
+
+                    const float *k = qkv + qkv_offset(b, j, 1, h, T, C, head_dim);
+                    float *dk = dqkv + qkv_offset(b, j, 1, h, T, C, head_dim);
+
+                    for (int d = 0; d < head_dim; ++d) {
+                        dq[d] += dscore * k[d];
+                        dk[d] += dscore * q[d];
+                    }
+                }
+            }
+        }
+    }
+
+    linear_backward(dx, dqkv_w, dqkv_b, dqkv, x, qkv_w, B * T, C, 3 * C);
+}
+#include "optim.h"
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+int adamw_init(adamw *opt, size_t count)
+{
+    memset(opt, 0, sizeof(*opt));
+
+    opt->m = (float *)calloc(count, sizeof(float));
+    opt->v = (float *)calloc(count, sizeof(float));
+    if (!opt->m || !opt->v) {
+        adamw_free(opt);
+        return 0;
+    }
+
+    opt->count = count;
+    opt->lr = ADAMW_DEFAULT_LR;
+    opt->beta1 = ADAMW_DEFAULT_BETA1;
+    opt->beta2 = ADAMW_DEFAULT_BETA2;
+    opt->eps = ADAMW_DEFAULT_EPS;
+    opt->weight_decay = ADAMW_DEFAULT_DECAY;
+    opt->step = 0;
+    return 1;
+}
+
+void adamw_free(adamw *opt)
+{
+    free(opt->m);
+    free(opt->v);
+    memset(opt, 0, sizeof(*opt));
+}
+
+void adamw_step(adamw *opt, float *params, const float *grads)
+{
+    opt->step++;
+
+    /* Computed once per step rather than per parameter. powf of a scalar is
+     * cheap, but not thirty thousand times cheap. */
+    float bias1 = 1.0f - powf(opt->beta1, (float)opt->step);
+    float bias2 = 1.0f - powf(opt->beta2, (float)opt->step);
+
+    for (size_t i = 0; i < opt->count; ++i) {
+        float g = grads[i];
+
+        opt->m[i] = opt->beta1 * opt->m[i] + (1.0f - opt->beta1) * g;
+        opt->v[i] = opt->beta2 * opt->v[i] + (1.0f - opt->beta2) * g * g;
+
+        float m_hat = opt->m[i] / bias1;
+        float v_hat = opt->v[i] / bias2;
+
+        /* Decoupled: the decay multiplies the parameter directly and never
+         * enters m or v, so it is not rescaled by the gradient history. */
+        params[i] -= opt->lr * opt->weight_decay * params[i];
+        params[i] -= opt->lr * m_hat / (sqrtf(v_hat) + opt->eps);
+    }
+}
+
+float clip_grad_norm(float *grads, size_t count, float max_norm)
+{
+    /* Accumulated in double. The sum runs over every parameter in the model, and
+     * in float32 the running total grows large enough that individual squared
+     * terms stop changing it -- the classic case where a sum of many small
+     * positive numbers silently stalls. */
+    double total = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        total += (double)grads[i] * (double)grads[i];
+    }
+
+    float norm = (float)sqrt(total);
+    if (norm > max_norm && norm > 0.0f) {
+        float scale = max_norm / norm;
+        for (size_t i = 0; i < count; ++i) {
+            grads[i] *= scale;
+        }
+    }
+    return norm;
+}
+#include "tensor.h"
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int product(int ndim, const int *dims)
+{
+    int total = 1;
+    for (int i = 0; i < ndim; ++i) {
+        total *= dims[i];
+    }
+    return total;
+}
+
+tensor tensor_alloc(int ndim, const int *dims)
+{
+    tensor t;
+    memset(&t, 0, sizeof(t));
+
+    if (ndim < 1 || ndim > TENSOR_MAX_DIMS) {
+        return t;
+    }
+
+    t.ndim = ndim;
+    for (int i = 0; i < ndim; ++i) {
+        t.dims[i] = dims[i];
+    }
+    t.size = product(ndim, dims);
+    t.owns_data = 1;
+    t.data = (float *)calloc((size_t)t.size, sizeof(float));
+    return t;
+}
+
+tensor tensor_alloc2(int rows, int cols)
+{
+    int dims[2] = { rows, cols };
+    return tensor_alloc(2, dims);
+}
+
+tensor tensor_alloc3(int a, int b, int c)
+{
+    int dims[3] = { a, b, c };
+    return tensor_alloc(3, dims);
+}
+
+tensor tensor_alloc4(int a, int b, int c, int d)
+{
+    int dims[4] = { a, b, c, d };
+    return tensor_alloc(4, dims);
+}
+
+void tensor_free(tensor *t)
+{
+    if (t && t->owns_data) {
+        free(t->data);
+    }
+    if (t) {
+        t->data = NULL;
+        t->size = 0;
+        t->ndim = 0;
+    }
+}
+
+tensor tensor_wrap(float *data, int ndim, const int *dims)
+{
+    tensor t;
+    memset(&t, 0, sizeof(t));
+
+    t.data = data;
+    t.ndim = ndim;
+    for (int i = 0; i < ndim && i < TENSOR_MAX_DIMS; ++i) {
+        t.dims[i] = dims[i];
+    }
+    t.size = product(ndim, dims);
+    t.owns_data = 0;
+    return t;
+}
+
+void tensor_zero(tensor *t)
+{
+    if (t && t->data) {
+        memset(t->data, 0, (size_t)t->size * sizeof(float));
+    }
+}
+
+void tensor_copy(tensor *dst, const tensor *src)
+{
+    if (dst && src && dst->data && src->data && dst->size == src->size) {
+        memcpy(dst->data, src->data, (size_t)src->size * sizeof(float));
+    }
+}
+
+int tensor_same_shape(const tensor *a, const tensor *b)
+{
+    if (a->ndim != b->ndim) {
+        return 0;
+    }
+    for (int i = 0; i < a->ndim; ++i) {
+        if (a->dims[i] != b->dims[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+tensor_diff tensor_compare(const tensor *a, const tensor *b)
+{
+    tensor_diff diff;
+    diff.max_abs = 0.0f;
+    diff.max_rel = 0.0f;
+    diff.index = -1;
+
+    if (!tensor_same_shape(a, b)) {
+        diff.max_abs = INFINITY;
+        diff.max_rel = INFINITY;
+        return diff;
+    }
+
+    for (int i = 0; i < a->size; ++i) {
+        float x = a->data[i], y = b->data[i];
+
+        if (isnan(x) != isnan(y) || isinf(x) != isinf(y)) {
+            diff.max_abs = INFINITY;
+            diff.max_rel = INFINITY;
+            diff.index = i;
+            return diff;
+        }
+        if (isnan(x) || isinf(x)) {
+            continue;   /* both are the same non-finite value */
+        }
+
+        float absolute = fabsf(x - y);
+        if (absolute > diff.max_abs) {
+            diff.max_abs = absolute;
+            diff.index = i;
+        }
+
+        /* Scaled by the larger magnitude rather than by one side, so the result
+         * does not depend on argument order, and floored so that a pair of
+         * values near zero reports a small relative error instead of a
+         * meaningless large one. */
+        float scale = fmaxf(fabsf(x), fabsf(y));
+        if (scale > 1e-6f) {
+            float relative = absolute / scale;
+            if (relative > diff.max_rel) {
+                diff.max_rel = relative;
+            }
+        }
+    }
+    return diff;
+}
+#include "tokenizer.h"
+
+#include <string.h>
+
+void tokenizer_fit(tokenizer *tok, const unsigned char *text, size_t length)
+{
+    int seen[TOKENIZER_MAX_VOCAB];
+    memset(seen, 0, sizeof(seen));
+
+    for (size_t i = 0; i < length; ++i) {
+        seen[text[i]] = 1;
+    }
+
+    for (int i = 0; i < TOKENIZER_MAX_VOCAB; ++i) {
+        tok->to_token[i] = -1;
+    }
+
+    tok->vocab_size = 0;
+    for (int byte = 0; byte < TOKENIZER_MAX_VOCAB; ++byte) {
+        if (seen[byte]) {
+            tok->to_token[byte] = tok->vocab_size;
+            tok->to_byte[tok->vocab_size] = (unsigned char)byte;
+            tok->vocab_size++;
+        }
+    }
+}
+
+size_t tokenizer_encode(const tokenizer *tok, const unsigned char *text,
+                        size_t length, int *out)
+{
+    size_t written = 0;
+    for (size_t i = 0; i < length; ++i) {
+        int token = tok->to_token[text[i]];
+        if (token >= 0) {
+            out[written++] = token;
+        }
+    }
+    return written;
+}
+
+void tokenizer_decode(const tokenizer *tok, const int *tokens, size_t count,
+                      unsigned char *out)
+{
+    for (size_t i = 0; i < count; ++i) {
+        int t = tokens[i];
+        out[i] = (t >= 0 && t < tok->vocab_size) ? tok->to_byte[t] : (unsigned char)'?';
+    }
+}
+/* The assembled GPT: embeddings, a stack of pre-norm blocks, and a language
+ * modelling head.
+ *
+ * MEMORY. Parameters live in one allocation and activations in another, with
+ * the named fields pointing into them. Three reasons, in order of how much they
+ * matter:
+ *
+ *   1. Zeroing gradients is one memset over a contiguous block rather than a
+ *      walk over a dozen buffers. Since every backward function accumulates,
+ *      failing to zero one of them produces a slow drift rather than a crash,
+ *      and the only reliable defence is making it impossible to miss one.
+ *   2. An optimiser sees a flat float array. AdamW becomes a single loop over
+ *      `count` elements with no knowledge of the model's structure.
+ *   3. Checkpointing is an fwrite of one block.
+ *
+ * The same struct describes parameters and their gradients, because they have
+ * identical shapes. `gpt_params grads` reads better than a parallel set of
+ * `d`-prefixed fields, and it makes the symmetry between the two passes visible.
+ *
+ * ACTIVATIONS are kept for the whole forward pass rather than recomputed. This
+ * is the standard time/memory trade and it is the right one here: the backward
+ * pass needs almost every intermediate, and recomputing them would roughly
+ * double the cost of a step to save memory this model does not need.
+ */
+
+#ifndef MODEL_H
+#define MODEL_H
+
+#include <stddef.h>
+
+typedef struct {
+    int vocab_size;
+    int block_size;     /* maximum context length */
+    int n_layer;
+    int n_head;
+    int n_embd;
+} gpt_config;
+
+/* Parameters, or equally their gradients. Per-layer fields are laid out with
+ * layer index outermost, so layer l's LayerNorm weight starts at
+ * ln1_w + l * n_embd. */
+typedef struct {
+    float *wte;         /* (vocab_size, n_embd)  token embedding */
+    float *wpe;         /* (block_size, n_embd)  position embedding */
+
+    float *ln1_w, *ln1_b;       /* (L, C) */
+    float *qkv_w;               /* (L, 3C, C) */
+    float *qkv_b;               /* (L, 3C) */
+    float *proj_w, *proj_b;     /* (L, C, C) and (L, C) */
+    float *ln2_w, *ln2_b;       /* (L, C) */
+    float *fc_w, *fc_b;         /* (L, 4C, C) and (L, 4C) */
+    float *fcproj_w, *fcproj_b; /* (L, C, 4C) and (L, C) */
+
+    float *lnf_w, *lnf_b;       /* (C) */
+    float *lm_head;             /* (vocab_size, n_embd), no bias */
+
+    float *storage;             /* the single allocation behind all of it */
+    size_t count;               /* total floats, for the optimiser */
+} gpt_params;
+
+/* Saved intermediates. Named for what produced them, in forward order. */
+typedef struct {
+    float *embedded;        /* (B, T, C)      wte[idx] + wpe[pos] */
+
+    float *ln1;             /* (L, B, T, C) */
+    float *ln1_mean, *ln1_rstd;     /* (L, B, T) */
+    float *qkv;             /* (L, B, T, 3C) */
+    float *att;             /* (L, B, n_head, T, T) */
+    float *attn_out;        /* (L, B, T, C)  heads merged, before the projection */
+    float *attn_proj;       /* (L, B, T, C) */
+    float *residual1;       /* (L, B, T, C) */
+
+    float *ln2;             /* (L, B, T, C) */
+    float *ln2_mean, *ln2_rstd;
+    float *fc;              /* (L, B, T, 4C) */
+    float *gelu;            /* (L, B, T, 4C) */
+    float *mlp_out;         /* (L, B, T, C) */
+    float *residual2;       /* (L, B, T, C)  the block's output */
+
+    float *lnf;             /* (B, T, C) */
+    float *lnf_mean, *lnf_rstd;
+    float *logits;          /* (B, T, vocab_size) */
+    float *probs;           /* (B, T, vocab_size) */
+
+    float *storage;
+    size_t count;
+    int batch;              /* the B these were sized for */
+} gpt_activations;
+
+/* Scratch for the backward pass: one buffer per activation shape that needs a
+ * gradient, plus the two attention temporaries. Allocated once and reused, and
+ * zeroed at the start of every backward pass. */
+typedef struct {
+    float *storage;
+    size_t count;
+    int batch;
+} gpt_grad_workspace;
+
+typedef struct {
+    gpt_config config;
+    gpt_params params;
+    gpt_params grads;
+    gpt_activations acts;
+    gpt_grad_workspace workspace;
+} gpt_model;
+
+/* Returns 0 on allocation failure, leaving nothing allocated. */
+int gpt_init(gpt_model *model, gpt_config config, int batch);
+void gpt_free(gpt_model *model);
+
+size_t gpt_parameter_count(gpt_config config);
+
+/* Fills parameters with a deterministic pseudo-random init. Kept in the library
+ * rather than left to the caller so that a from-scratch run is reproducible
+ * without a source of randomness. */
+void gpt_randomize(gpt_model *model, unsigned seed);
+
+/* Forward pass. targets may be NULL, in which case no loss is computed and the
+ * return value is 0; logits are still written. idx and targets are (B, T). */
+float gpt_forward(gpt_model *model, const int *idx, const int *targets, int T);
+
+/* Forward over fewer rows than the model was allocated for. The activation
+ * buffers are sized by the maximum batch, and every stride is computed from the
+ * batch actually passed, so a smaller one simply uses less of them. Generation
+ * needs this: it runs one sequence at a time. */
+float gpt_forward_batch(gpt_model *model, const int *idx, const int *targets,
+                        int B, int T);
+
+/* Backward pass. Must follow a gpt_forward with the same inputs, whose saved
+ * activations it reads. Gradients accumulate into model->grads, so call
+ * gpt_zero_grad first unless deliberately accumulating across microbatches. */
+void gpt_backward(gpt_model *model, const int *idx, const int *targets, int T);
+
+void gpt_zero_grad(gpt_model *model);
+
+/* Autoregressive sampling. Writes prompt_len + max_new tokens into out and
+ * returns the count.
+ *
+ * Context is truncated to the last block_size tokens, because the position
+ * embedding has no entry beyond that -- the model cannot represent a longer
+ * sequence, and indexing past the table would read whatever follows it.
+ *
+ * temperature divides the logits before the softmax: below 1 it sharpens the
+ * distribution toward the argmax, above 1 flattens it. At exactly 0 it would
+ * divide by zero, so that case takes the argmax directly. */
+int gpt_generate(gpt_model *model, const int *prompt, int prompt_len,
+                 int *out, int max_new, float temperature, unsigned *rng);
+
+#endif /* MODEL_H */
+/* Transformer primitives, forward and backward.
+ *
+ * Every backward pass here is hand-derived. That is the point of the project:
+ * the forward pass of a transformer is short enough to write from the paper,
+ * and autograd makes the backward pass free, so writing only the forward half
+ * demonstrates nothing that reading the paper would not.
+ *
+ * CONVENTIONS
+ *
+ * Gradients ACCUMULATE into their output buffers. Callers zero them once per
+ * step. This is what lets a parameter used in several places -- tied embeddings,
+ * or a weight shared across positions -- collect gradient from each use without
+ * the operations knowing about each other. It also means forgetting to zero
+ * produces a slow, plausible-looking divergence rather than an obvious crash,
+ * which is why the training loop zeroes in exactly one place.
+ *
+ * Backward functions take the forward pass's inputs and its saved outputs.
+ * Nothing is recomputed that was already computed, and nothing is cached that
+ * can be passed in; the caller owns all storage.
+ *
+ * Shapes are given in comments as (rows, cols) or (batch, time, channels).
+ * There is no shape checking at runtime -- these are internal calls on
+ * fixed-size buffers, and the test suite pins every shape against the oracle.
+ */
+
+#ifndef OPS_H
+#define OPS_H
+
+#include "tensor.h"
+
+/* ---- Linear: y = x W^T + b ---------------------------------------------
+ *
+ * W is stored (out_features, in_features), matching PyTorch's nn.Linear, so
+ * the forward pass walks both operands' rows contiguously. */
+void linear_forward(float *out, const float *x, const float *weight,
+                    const float *bias, int rows, int in_features,
+                    int out_features);
+
+void linear_backward(float *dx, float *dweight, float *dbias,
+                     const float *dout, const float *x, const float *weight,
+                     int rows, int in_features, int out_features);
+
+/* ---- LayerNorm over the last axis --------------------------------------
+ *
+ * mean and rstd are written by the forward pass and required by the backward
+ * pass. Recomputing them from x would be arithmetically identical but would
+ * double the cost of the backward pass for no benefit. */
+void layernorm_forward(float *out, float *mean, float *rstd, const float *x,
+                       const float *weight, const float *bias,
+                       int rows, int cols, float eps);
+
+void layernorm_backward(float *dx, float *dweight, float *dbias,
+                        const float *dout, const float *x, const float *mean,
+                        const float *rstd, const float *weight,
+                        int rows, int cols);
+
+/* ---- GELU, exact ---------------------------------------------------------
+ *
+ * 0.5x(1 + erf(x/sqrt(2))), not the tanh approximation. The two differ by about
+ * 1e-3, which is three orders of magnitude above the tolerance these tests run
+ * at, so the choice is load-bearing rather than cosmetic. */
+void gelu_forward(float *out, const float *x, int n);
+void gelu_backward(float *dx, const float *dout, const float *x, int n);
+
+/* ---- Softmax over the last axis ----------------------------------------- */
+void softmax_forward(float *out, const float *x, int rows, int cols);
+
+/* The Jacobian is dense -- every output in a row depends on every input in it --
+ * but it collapses to dx = y * (dy - sum(dy * y)), which costs two passes and
+ * no matrix. */
+void softmax_backward(float *dx, const float *dout, const float *out,
+                      int rows, int cols);
+
+/* ---- Cross entropy over logits ------------------------------------------
+ *
+ * Fused with the softmax, because the composition's gradient is (p - onehot)/n
+ * and computing it that way avoids both the division by a near-zero probability
+ * and the catastrophic cancellation that a separate softmax and log would
+ * produce for a confident wrong prediction. Returns the mean loss. */
+float crossentropy_forward(float *probs, const float *logits,
+                           const int *targets, int rows, int classes);
+
+void crossentropy_backward(float *dlogits, const float *probs,
+                           const int *targets, int rows, int classes);
+
+/* ---- Multi-head causal self-attention -----------------------------------
+ *
+ * Covers the fused QKV projection through to the merged output, but not the
+ * output projection that follows it -- that is an ordinary linear, and keeping
+ * it outside means this function has one job.
+ *
+ * LAYOUT. qkv is (B, T, 3C), holding q, k and v concatenated along the last
+ * axis in that order, which is what a single projection produces and what
+ * PyTorch's split(C, dim=2) expects. Within each of those C-wide sections the
+ * heads are laid out contiguously, so head h of q at position t starts at
+ * qkv[((b*T + t)*3 + 0)*C + h*head_dim]. That indexing is the whole of the
+ * "transpose(1, 2)" the PyTorch version writes explicitly; no data moves.
+ *
+ * att is (B, n_head, T, T), holding the softmax output. Entries above the
+ * diagonal are written as exact zero rather than left undefined, so the buffer
+ * can be compared against PyTorch's masked result directly.
+ *
+ * The caller owns qkv and att. They are outputs of the forward pass and inputs
+ * to the backward pass: recomputing them would cost a second forward pass, and
+ * caching them inside would mean the library allocating.
+ */
+void attention_forward(float *out, float *qkv, float *att,
+                       const float *x, const float *qkv_w, const float *qkv_b,
+                       int B, int T, int C, int n_head);
+
+/* dqkv and datt are scratch, sized like qkv and att. The caller zeroes them;
+ * like every other backward here, gradients accumulate. */
+void attention_backward(float *dx, float *dqkv_w, float *dqkv_b,
+                        float *dqkv, float *datt,
+                        const float *dout, const float *x, const float *qkv_w,
+                        const float *qkv, const float *att,
+                        int B, int T, int C, int n_head);
+
+#endif /* OPS_H */
+/* AdamW.
+ *
+ * Adam keeps two running averages per parameter -- of the gradient, and of the
+ * gradient squared -- and divides one by the square root of the other. The
+ * effect is a per-parameter learning rate: a weight whose gradient has been
+ * consistently large gets a smaller step than one whose gradient is small but
+ * steady. That is why it trains transformers where plain SGD needs careful
+ * tuning per layer.
+ *
+ * The W is not a detail. Adam with L2 regularization added to the gradient does
+ * something different from Adam with weight decay applied to the parameter,
+ * because the L2 term passes through the same 1/sqrt(v) scaling as everything
+ * else -- so parameters with large gradients get *less* regularization, which
+ * is backwards. Decoupling it, as here, applies the same shrinkage to every
+ * parameter regardless of its gradient history.
+ *
+ * The optimizer sees a flat float array and knows nothing about the model's
+ * structure, which is the payoff for keeping parameters in one allocation.
+ */
+
+#ifndef OPTIM_H
+#define OPTIM_H
+
+#include <stddef.h>
+
+typedef struct {
+    float *m;           /* first moment, one per parameter */
+    float *v;           /* second moment */
+    size_t count;
+
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+
+    long step;          /* 1-based; drives the bias correction */
+} adamw;
+
+#define ADAMW_DEFAULT_LR      3e-4f
+#define ADAMW_DEFAULT_BETA1   0.9f
+#define ADAMW_DEFAULT_BETA2   0.999f
+#define ADAMW_DEFAULT_EPS     1e-8f
+#define ADAMW_DEFAULT_DECAY   0.1f
+
+/* Returns 0 if the moment buffers could not be allocated. */
+int adamw_init(adamw *opt, size_t count);
+void adamw_free(adamw *opt);
+
+/* One update. Reads grads, writes params, advances the moments.
+ *
+ * Both moments start at zero, which biases them toward zero for the first
+ * several steps -- badly at step 1, where the estimate is (1 - beta) times the
+ * true value, so 0.001 times it for the second moment. The bias correction
+ * divides that factor out. Omitting it does not prevent training but makes the
+ * first steps far too small, and it is invisible in a single-step test because
+ * the correction is largest exactly there. */
+void adamw_step(adamw *opt, float *params, const float *grads);
+
+/* Scales gradients so their global L2 norm does not exceed max_norm, and
+ * returns the norm before scaling.
+ *
+ * A single bad batch can produce a gradient hundreds of times the usual size,
+ * and Adam does not save you from it: the update is bounded by roughly the
+ * learning rate per step, but the second-moment estimate absorbs the spike and
+ * then suppresses that parameter's updates for hundreds of steps afterwards.
+ * Clipping the whole vector, rather than each element, preserves the gradient's
+ * direction and changes only its length. */
+float clip_grad_norm(float *grads, size_t count, float max_norm);
+
+#endif /* OPTIM_H */
+/* Flat float32 tensors.
+ *
+ * Deliberately not a general tensor library. There are no strides, no views and
+ * no broadcasting: every tensor owns a contiguous row-major block, and the
+ * operations in ops.h index it arithmetically. A transformer needs exactly one
+ * memory layout, and supporting more would add the machinery this project
+ * exists to avoid.
+ *
+ * Row-major and contiguous also means the layout matches what PyTorch writes
+ * with `.contiguous().numpy().tobytes()`, so oracle data loads with a single
+ * fread and comparisons are element-for-element.
+ */
+
+#ifndef TENSOR_H
+#define TENSOR_H
+
+#include <stddef.h>
+
+#define TENSOR_MAX_DIMS 4
+
+typedef struct {
+    float *data;
+    int dims[TENSOR_MAX_DIMS];
+    int ndim;
+    int size;           /* product of dims, cached */
+    int owns_data;      /* 0 for a borrowed pointer, e.g. a slice of a buffer */
+} tensor;
+
+/* Allocates zeroed storage. Returns a tensor with data == NULL on failure;
+ * callers in tests check that, and the library itself allocates only at model
+ * construction, never inside a forward or backward pass. */
+tensor tensor_alloc(int ndim, const int *dims);
+tensor tensor_alloc2(int rows, int cols);
+tensor tensor_alloc3(int a, int b, int c);
+tensor tensor_alloc4(int a, int b, int c, int d);
+
+void tensor_free(tensor *t);
+
+/* Wraps existing memory without copying. The result must not be freed. */
+tensor tensor_wrap(float *data, int ndim, const int *dims);
+
+void tensor_zero(tensor *t);
+void tensor_copy(tensor *dst, const tensor *src);
+
+int tensor_same_shape(const tensor *a, const tensor *b);
+
+/* Largest absolute and relative difference between two equally shaped tensors.
+ * Both matter: absolute error alone flags large values that agree to eight
+ * significant figures, and relative error alone explodes on values near zero
+ * where the absolute difference is meaningless. The tests require both to be
+ * small, which neither measure achieves on its own. */
+typedef struct {
+    float max_abs;
+    float max_rel;
+    int index;          /* where max_abs occurred, for reporting */
+} tensor_diff;
+
+tensor_diff tensor_compare(const tensor *a, const tensor *b);
+
+#endif /* TENSOR_H */
+/* Character-level tokenizer.
+ *
+ * One token per byte value present in the corpus. This is the least interesting
+ * tokenizer that works, chosen deliberately: BPE is a substantial piece of work
+ * in its own right and would sit between this project and the thing it is about,
+ * which is the forward and backward passes. A character vocabulary also keeps
+ * the embedding and output matrices small enough that the parameter count stays
+ * dominated by the transformer blocks rather than by the vocabulary.
+ *
+ * The cost is real and worth stating: sequences are several times longer than
+ * they would be under BPE, so a given context length covers far less text, and
+ * attention is quadratic in that length.
+ */
+
+#ifndef TOKENIZER_H
+#define TOKENIZER_H
+
+#include <stddef.h>
+
+#define TOKENIZER_MAX_VOCAB 256
+
+typedef struct {
+    /* Dense id for each byte, or -1 when that byte never appears. Indexed by
+     * the byte value itself, so encoding is a single array lookup. */
+    int to_token[TOKENIZER_MAX_VOCAB];
+    unsigned char to_byte[TOKENIZER_MAX_VOCAB];
+    int vocab_size;
+} tokenizer;
+
+/* Builds the vocabulary from a corpus. Tokens are assigned in ascending byte
+ * order rather than by frequency, so the mapping is reproducible from the text
+ * alone and a checkpoint does not need the vocabulary stored alongside it. */
+void tokenizer_fit(tokenizer *tok, const unsigned char *text, size_t length);
+
+/* Returns the number of tokens written. Bytes absent from the vocabulary are
+ * skipped rather than mapped to a placeholder: with a vocabulary built from the
+ * same corpus there are none, and inventing an unknown token would put a symbol
+ * in the training data that never appears in the text. */
+size_t tokenizer_encode(const tokenizer *tok, const unsigned char *text,
+                        size_t length, int *out);
+
+void tokenizer_decode(const tokenizer *tok, const int *tokens, size_t count,
+                      unsigned char *out);
+
+#endif /* TOKENIZER_H */
+#include <stdio.h>
+
+int tests_run = 0;
+int checks_failed = 0;
+
+void register_op_tests(void);
+void register_model_tests(void);
+void register_optim_tests(void);
+void register_tokenizer_tests(void);
+
+int main(void)
+{
+    printf("gpt-in-c test suite\n\n");
+
+    register_op_tests();
+    register_model_tests();
+    register_optim_tests();
+    register_tokenizer_tests();
+
+    printf("\n%d tests, %d failed checks\n", tests_run, checks_failed);
+    return checks_failed == 0 ? 0 : 1;
+}
+/* Reads the binary dumps written by ref/reference.py and ref/units.py.
+ *
+ * Lives in tests/ rather than src/ so the library keeps no file I/O and no
+ * stdio dependency -- the same objects compile for a freestanding target.
+ */
+
+#include "oracle.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define ORACLE_MAGIC "GPTC"
+#define ORACLE_VERSION 1u
+
+static int read_u32(FILE *f, unsigned *out)
+{
+    unsigned char bytes[4];
+    if (fread(bytes, 1, 4, f) != 4) {
+        return 0;
+    }
+    /* Assembled byte by byte rather than fread into an unsigned, so the file
+     * stays little-endian regardless of the host. */
+    *out = (unsigned)bytes[0] | ((unsigned)bytes[1] << 8) |
+           ((unsigned)bytes[2] << 16) | ((unsigned)bytes[3] << 24);
+    return 1;
+}
+
+int oracle_load(oracle *store, const char *path)
+{
+    memset(store, 0, sizeof(*store));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "oracle: cannot open %s\n"
+                        "  run: python ref/reference.py && python ref/units.py\n",
+                path);
+        return 0;
+    }
+
+    char magic[4];
+    unsigned version, count;
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, ORACLE_MAGIC, 4) != 0) {
+        fprintf(stderr, "oracle: %s is not a GPTC file\n", path);
+        fclose(f);
+        return 0;
+    }
+    if (!read_u32(f, &version) || version != ORACLE_VERSION) {
+        fprintf(stderr, "oracle: %s has version %u, expected %u\n",
+                path, version, ORACLE_VERSION);
+        fclose(f);
+        return 0;
+    }
+    if (!read_u32(f, &count) || count > ORACLE_MAX_TENSORS) {
+        fprintf(stderr, "oracle: %s holds %u tensors, limit is %d\n",
+                path, count, ORACLE_MAX_TENSORS);
+        fclose(f);
+        return 0;
+    }
+
+    for (unsigned i = 0; i < count; ++i) {
+        oracle_entry *entry = &store->entries[i];
+        unsigned name_length, ndim;
+
+        if (!read_u32(f, &name_length) || name_length >= ORACLE_MAX_NAME) {
+            fprintf(stderr, "oracle: bad name length at tensor %u\n", i);
+            fclose(f);
+            return 0;
+        }
+        if (fread(entry->name, 1, name_length, f) != name_length) {
+            fclose(f);
+            return 0;
+        }
+        entry->name[name_length] = '\0';
+
+        if (!read_u32(f, &ndim) || ndim < 1 || ndim > TENSOR_MAX_DIMS) {
+            fprintf(stderr, "oracle: %s has ndim %u\n", entry->name, ndim);
+            fclose(f);
+            return 0;
+        }
+
+        int dims[TENSOR_MAX_DIMS];
+        for (unsigned d = 0; d < ndim; ++d) {
+            unsigned value;
+            if (!read_u32(f, &value)) {
+                fclose(f);
+                return 0;
+            }
+            dims[d] = (int)value;
+        }
+
+        entry->value = tensor_alloc((int)ndim, dims);
+        if (!entry->value.data) {
+            fprintf(stderr, "oracle: out of memory for %s\n", entry->name);
+            fclose(f);
+            return 0;
+        }
+        if (fread(entry->value.data, sizeof(float), (size_t)entry->value.size, f)
+                != (size_t)entry->value.size) {
+            fprintf(stderr, "oracle: truncated data for %s\n", entry->name);
+            fclose(f);
+            return 0;
+        }
+        store->count++;
+    }
+
+    fclose(f);
+    return 1;
+}
+
+const tensor *oracle_find(const oracle *store, const char *name)
+{
+    for (int i = 0; i < store->count; ++i) {
+        if (strcmp(store->entries[i].name, name) == 0) {
+            return &store->entries[i].value;
+        }
+    }
+    return NULL;
+}
+
+const tensor *oracle_require(const oracle *store, const char *name)
+{
+    const tensor *found = oracle_find(store, name);
+    if (!found) {
+        /* A missing tensor means the dump and the test have drifted apart. That
+         * is a broken test rather than a failing one, so it aborts instead of
+         * being counted as a numerical disagreement. */
+        fprintf(stderr, "oracle: no tensor named '%s' in the dump\n", name);
+        exit(2);
+    }
+    return found;
+}
+
+void oracle_free(oracle *store)
+{
+    for (int i = 0; i < store->count; ++i) {
+        tensor_free(&store->entries[i].value);
+    }
+    store->count = 0;
+}
+/* The assembled model against PyTorch, and against the definition of a
+ * derivative.
+ *
+ * Two independent checks, which is the point. The oracle comparison is precise
+ * but shares an assumption with the thing it checks: both implement the same
+ * architecture from the same description, so a misreading of the architecture
+ * would be reproduced on both sides and agree perfectly. The finite-difference
+ * check knows nothing about transformers -- it only knows that a gradient is
+ * the limit of a difference quotient -- so it cannot share that error.
+ */
+
+#include "test.h"
+#include "oracle.h"
+#include "../src/model.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define ABS_TOL 2e-5f
+#define REL_TOL 2e-4f
+
+static oracle full;
+
+/* The oracle's config, matching ref/reference.py's DEFAULT_CONFIG. */
+static gpt_config oracle_config(void)
+{
+    gpt_config c;
+    c.vocab_size = 65;
+    c.block_size = 16;
+    c.n_layer = 2;
+    c.n_head = 4;
+    c.n_embd = 32;
+    return c;
+}
+
+/* Copies one PyTorch tensor into a destination, checking the element count
+ * rather than trusting the layout. A silent size mismatch here would corrupt
+ * every parameter after it in the flat storage. */
+static void load_into(float *dst, const char *name, size_t expected)
+{
+    const tensor *t = oracle_require(&full, name);
+    if ((size_t)t->size != expected) {
+        printf("  FAILED %s: oracle has %d floats, model expects %zu\n",
+               name, t->size, expected);
+        checks_failed++;
+        return;
+    }
+    memcpy(dst, t->data, expected * sizeof(float));
+}
+
+/* Walks every parameter, applying `visit` to the model pointer and the oracle's
+ * name for it. Used for loading parameters and for comparing gradients, so the
+ * two cannot cover different sets. */
+static void for_each_parameter(gpt_model *model, const char *prefix,
+                               void (*visit)(float *, const char *, size_t))
+{
+    gpt_config c = model->config;
+    gpt_params *p = &model->params;
+    int C = c.n_embd;
+    char name[ORACLE_MAX_NAME];
+
+    snprintf(name, sizeof(name), "%s.wte.weight", prefix);
+    visit(p->wte, name, (size_t)c.vocab_size * C);
+    snprintf(name, sizeof(name), "%s.wpe.weight", prefix);
+    visit(p->wpe, name, (size_t)c.block_size * C);
+
+    for (int l = 0; l < c.n_layer; ++l) {
+        snprintf(name, sizeof(name), "%s.blocks.%d.ln_1.weight", prefix, l);
+        visit(p->ln1_w + (size_t)l * C, name, (size_t)C);
+        snprintf(name, sizeof(name), "%s.blocks.%d.ln_1.bias", prefix, l);
+        visit(p->ln1_b + (size_t)l * C, name, (size_t)C);
+
+        snprintf(name, sizeof(name), "%s.blocks.%d.attn.c_attn.weight", prefix, l);
+        visit(p->qkv_w + (size_t)l * 3 * C * C, name, (size_t)3 * C * C);
+        snprintf(name, sizeof(name), "%s.blocks.%d.attn.c_attn.bias", prefix, l);
+        visit(p->qkv_b + (size_t)l * 3 * C, name, (size_t)3 * C);
+
+        snprintf(name, sizeof(name), "%s.blocks.%d.attn.c_proj.weight", prefix, l);
+        visit(p->proj_w + (size_t)l * C * C, name, (size_t)C * C);
+        snprintf(name, sizeof(name), "%s.blocks.%d.attn.c_proj.bias", prefix, l);
+        visit(p->proj_b + (size_t)l * C, name, (size_t)C);
+
+        snprintf(name, sizeof(name), "%s.blocks.%d.ln_2.weight", prefix, l);
+        visit(p->ln2_w + (size_t)l * C, name, (size_t)C);
+        snprintf(name, sizeof(name), "%s.blocks.%d.ln_2.bias", prefix, l);
+        visit(p->ln2_b + (size_t)l * C, name, (size_t)C);
+
+        snprintf(name, sizeof(name), "%s.blocks.%d.mlp.c_fc.weight", prefix, l);
+        visit(p->fc_w + (size_t)l * 4 * C * C, name, (size_t)4 * C * C);
+        snprintf(name, sizeof(name), "%s.blocks.%d.mlp.c_fc.bias", prefix, l);
+        visit(p->fc_b + (size_t)l * 4 * C, name, (size_t)4 * C);
+
+        snprintf(name, sizeof(name), "%s.blocks.%d.mlp.c_proj.weight", prefix, l);
+        visit(p->fcproj_w + (size_t)l * C * 4 * C, name, (size_t)C * 4 * C);
+        snprintf(name, sizeof(name), "%s.blocks.%d.mlp.c_proj.bias", prefix, l);
+        visit(p->fcproj_b + (size_t)l * C, name, (size_t)C);
+    }
+
+    snprintf(name, sizeof(name), "%s.ln_f.weight", prefix);
+    visit(p->lnf_w, name, (size_t)C);
+    snprintf(name, sizeof(name), "%s.ln_f.bias", prefix);
+    visit(p->lnf_b, name, (size_t)C);
+    snprintf(name, sizeof(name), "%s.lm_head.weight", prefix);
+    visit(p->lm_head, name, (size_t)c.vocab_size * C);
+}
+
+static void compare_gradient(float *computed, const char *name, size_t count)
+{
+    const tensor *expected = oracle_require(&full, name);
+    if ((size_t)expected->size != count) {
+        printf("  FAILED %s: shape mismatch\n", name);
+        checks_failed++;
+        return;
+    }
+
+    int dims[1] = { (int)count };
+    tensor got = tensor_wrap(computed, 1, dims);
+    tensor want = tensor_wrap(expected->data, 1, dims);
+    tensor_diff d = tensor_compare(&got, &want);
+
+    if (!(d.max_abs <= ABS_TOL || d.max_rel <= REL_TOL)) {
+        printf("  FAILED gradient %s: max_abs %.3g, max_rel %.3g at %d\n",
+               name, (double)d.max_abs, (double)d.max_rel, d.index);
+        checks_failed++;
+    }
+}
+
+/* for_each_parameter hands the model's parameter pointer to its visitor, but
+ * gradients live in a parallel struct. This offsets into it by the same
+ * distance, which works because both are laid out by the same function. */
+static gpt_model *active_model;
+
+static void load_parameter(float *dst, const char *name, size_t count)
+{
+    load_into(dst, name, count);
+}
+
+static void compare_matching_gradient(float *param_ptr, const char *name,
+                                      size_t count)
+{
+    size_t offset = (size_t)(param_ptr - active_model->params.storage);
+    compare_gradient(active_model->grads.storage + offset, name, count);
+}
+
+static void read_indices(int *out, const char *name, int count)
+{
+    const tensor *t = oracle_require(&full, name);
+    for (int i = 0; i < count && i < t->size; ++i) {
+        out[i] = (int)t->data[i];
+    }
+}
+
+static void test_forward_matches_pytorch(void)
+{
+    gpt_config config = oracle_config();
+    const tensor *idx_tensor = oracle_require(&full, "input.idx");
+    int B = idx_tensor->dims[0], T = idx_tensor->dims[1];
+
+    gpt_model model;
+    CHECK(gpt_init(&model, config, B));
+    active_model = &model;
+
+    for_each_parameter(&model, "param", load_parameter);
+
+    int *idx = (int *)malloc((size_t)B * T * sizeof(int));
+    int *targets = (int *)malloc((size_t)B * T * sizeof(int));
+    read_indices(idx, "input.idx", B * T);
+    read_indices(targets, "input.targets", B * T);
+
+    float loss = gpt_forward(&model, idx, targets, T);
+
+    const tensor *expected_loss = oracle_require(&full, "loss");
+    CHECK_NEAR(loss, expected_loss->data[0], 1e-4);
+
+    const tensor *expected_logits = oracle_require(&full, "act.logits");
+    int dims[1] = { expected_logits->size };
+    tensor got = tensor_wrap(model.acts.logits, 1, dims);
+    tensor want = tensor_wrap(expected_logits->data, 1, dims);
+    CHECK_MATCHES(&got, &want, ABS_TOL, REL_TOL);
+
+    free(idx); free(targets);
+    gpt_free(&model);
+}
+
+static void test_backward_matches_pytorch(void)
+{
+    gpt_config config = oracle_config();
+    const tensor *idx_tensor = oracle_require(&full, "input.idx");
+    int B = idx_tensor->dims[0], T = idx_tensor->dims[1];
+
+    gpt_model model;
+    CHECK(gpt_init(&model, config, B));
+    active_model = &model;
+
+    for_each_parameter(&model, "param", load_parameter);
+
+    int *idx = (int *)malloc((size_t)B * T * sizeof(int));
+    int *targets = (int *)malloc((size_t)B * T * sizeof(int));
+    read_indices(idx, "input.idx", B * T);
+    read_indices(targets, "input.targets", B * T);
+
+    gpt_forward(&model, idx, targets, T);
+    gpt_zero_grad(&model);
+    gpt_backward(&model, idx, targets, T);
+
+    /* Every parameter, not a sample of them. A gradient that is wrong in one
+     * layer only is the realistic failure, and checking a few would miss it. */
+    for_each_parameter(&model, "grad", compare_matching_gradient);
+
+    free(idx); free(targets);
+    gpt_free(&model);
+}
+
+static void test_gradients_match_finite_differences(void)
+{
+    /* Independent of PyTorch entirely: perturb a parameter, measure how the
+     * loss actually moves, and compare against the analytic gradient.
+     *
+     * The tolerance is loose -- 5% -- and that is inherent rather than lazy. A
+     * central difference has truncation error growing with eps^2, while float32
+     * cancellation error grows as the loss difference shrinks relative to the
+     * loss itself, so the two error sources squeeze the usable range of eps from
+     * both sides. At eps = 1e-2 the difference in loss is around 1e-4 against a
+     * loss of 4.3, which is only two or three digits above float32's resolution
+     * there.
+     *
+     * This is therefore a coarse check, and it is aimed at coarse errors: a sign
+     * flip, a missing factor, a gradient that belongs to a different parameter.
+     * Anything subtler is the oracle's job, and the oracle is tight to 2e-5.
+     */
+    gpt_config config = oracle_config();
+    const tensor *idx_tensor = oracle_require(&full, "input.idx");
+    int B = idx_tensor->dims[0], T = idx_tensor->dims[1];
+
+    gpt_model model;
+    CHECK(gpt_init(&model, config, B));
+    active_model = &model;
+    for_each_parameter(&model, "param", load_parameter);
+
+    int *idx = (int *)malloc((size_t)B * T * sizeof(int));
+    int *targets = (int *)malloc((size_t)B * T * sizeof(int));
+    read_indices(idx, "input.idx", B * T);
+    read_indices(targets, "input.targets", B * T);
+
+    gpt_forward(&model, idx, targets, T);
+    gpt_zero_grad(&model);
+    gpt_backward(&model, idx, targets, T);
+
+    const float eps = 1e-2f;
+    /* Spread across the whole parameter block using a prime stride, so the
+     * sample touches embeddings, both layers and the head rather than
+     * clustering in whichever one happens to come first. Most parameters in a
+     * freshly initialised model have gradients too small to resolve against
+     * float32 noise, so the stride has to be small enough that enough survive
+     * the magnitude filter below. */
+    size_t stride = 37;
+    int checked = 0, agreed = 0;
+
+    for (size_t i = 0; i < model.params.count && checked < 60; i += stride) {
+        float analytic = model.grads.storage[i];
+
+        /* The magnitude floor is derived, not guessed. A central difference
+         * moves the loss by about 2*eps*grad, and float32 resolves a loss near
+         * 4.3 to roughly 5e-7. Requiring the signal to be several hundred times
+         * that resolution gives
+         *
+         *     2 * 1e-2 * grad > 2e-4     ->     grad > 1e-2
+         *
+         * Below that the quotient is mostly cancellation noise: a gradient of
+         * 1e-3 shifts the loss by 2e-5, which carries barely two significant
+         * digits, and comparing it at 5% fails on rounding alone. */
+        if (fabsf(analytic) < 1e-2f) {
+            continue;
+        }
+
+        float original = model.params.storage[i];
+
+        model.params.storage[i] = original + eps;
+        float up = gpt_forward(&model, idx, targets, T);
+
+        model.params.storage[i] = original - eps;
+        float down = gpt_forward(&model, idx, targets, T);
+
+        model.params.storage[i] = original;
+
+        float numeric = (up - down) / (2.0f * eps);
+        float scale = fmaxf(fabsf(analytic), fabsf(numeric));
+        float relative = fabsf(analytic - numeric) / scale;
+
+        checked++;
+        if (relative < 0.05f) {
+            agreed++;
+        } else {
+            printf("  finite difference: index %zu analytic %.6f numeric %.6f "
+                   "(%.1f%% apart)\n", i, (double)analytic, (double)numeric,
+                   (double)(100.0f * relative));
+        }
+    }
+
+    CHECK(checked >= 20);       /* the sample must actually have found gradients */
+    CHECK(agreed == checked);
+
+    free(idx); free(targets);
+    gpt_free(&model);
+}
+
+static void test_parameter_count_matches_the_reference(void)
+{
+    /* 30,144 for this config, as ref/reference.py reports. A layout bug that
+     * over- or under-allocates shows up here rather than as heap corruption. */
+    CHECK(gpt_parameter_count(oracle_config()) == 30144);
+}
+
+static void test_zero_grad_clears_everything(void)
+{
+    gpt_config config = oracle_config();
+    gpt_model model;
+    CHECK(gpt_init(&model, config, 2));
+
+    for (size_t i = 0; i < model.grads.count; ++i) {
+        model.grads.storage[i] = 1.0f;
+    }
+    gpt_zero_grad(&model);
+
+    int clean = 1;
+    for (size_t i = 0; i < model.grads.count; ++i) {
+        if (model.grads.storage[i] != 0.0f) {
+            clean = 0;
+        }
+    }
+    CHECK(clean);
+    gpt_free(&model);
+}
+
+void register_model_tests(void)
+{
+    if (!oracle_load(&full, "data/oracle.bin")) {
+        exit(2);
+    }
+
+    RUN(test_parameter_count_matches_the_reference);
+    RUN(test_zero_grad_clears_everything);
+    RUN(test_forward_matches_pytorch);
+    RUN(test_backward_matches_pytorch);
+    RUN(test_gradients_match_finite_differences);
+
+    oracle_free(&full);
+}
+/* Each operation against PyTorch autograd, forward and backward.
+ *
+ * Tolerances are absolute 1e-5 or relative 1e-4, either sufficing. Both
+ * implementations are float32 and accumulate in a different order, so exact
+ * agreement is not available and demanding it would only produce a test that
+ * fails on a compiler flag change. These bounds are roughly two orders of
+ * magnitude tighter than any real bug produces: a dropped LayerNorm mean term,
+ * a missing softmax scale or a transposed matmul all disagree in the first or
+ * second significant figure, not the fifth.
+ */
+
+#include "test.h"
+#include "oracle.h"
+#include "../src/ops.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#define ABS_TOL 1e-5f
+#define REL_TOL 1e-4f
+
+static oracle units;
+
+/* Allocates a tensor shaped like the oracle's, so a shape change in the dump
+ * cannot silently pass by comparing differently shaped buffers. */
+static tensor like(const tensor *reference)
+{
+    return tensor_alloc(reference->ndim, reference->dims);
+}
+
+static void test_linear_forward_and_backward(void)
+{
+    const tensor *x = oracle_require(&units, "linear.x");
+    const tensor *weight = oracle_require(&units, "linear.weight");
+    const tensor *bias = oracle_require(&units, "linear.bias");
+    const tensor *expected = oracle_require(&units, "linear.out");
+    const tensor *dout = oracle_require(&units, "linear.dout");
+
+    int rows = x->dims[0], in_features = x->dims[1];
+    int out_features = weight->dims[0];
+
+    tensor out = like(expected);
+    linear_forward(out.data, x->data, weight->data, bias->data,
+                   rows, in_features, out_features);
+    CHECK_MATCHES(&out, expected, ABS_TOL, REL_TOL);
+
+    tensor dx = like(x), dweight = like(weight), dbias = like(bias);
+    linear_backward(dx.data, dweight.data, dbias.data, dout->data,
+                    x->data, weight->data, rows, in_features, out_features);
+
+    CHECK_MATCHES(&dx, oracle_require(&units, "linear.dx"), ABS_TOL, REL_TOL);
+    CHECK_MATCHES(&dweight, oracle_require(&units, "linear.dweight"), ABS_TOL, REL_TOL);
+    CHECK_MATCHES(&dbias, oracle_require(&units, "linear.dbias"), ABS_TOL, REL_TOL);
+
+    tensor_free(&out); tensor_free(&dx);
+    tensor_free(&dweight); tensor_free(&dbias);
+}
+
+static void test_layernorm_forward_and_backward(void)
+{
+    const tensor *x = oracle_require(&units, "layernorm.x");
+    const tensor *weight = oracle_require(&units, "layernorm.weight");
+    const tensor *bias = oracle_require(&units, "layernorm.bias");
+    const tensor *expected = oracle_require(&units, "layernorm.out");
+    const tensor *dout = oracle_require(&units, "layernorm.dout");
+
+    int cols = x->dims[x->ndim - 1];
+    int rows = x->size / cols;
+
+    tensor out = like(expected);
+    float *mean = (float *)calloc((size_t)rows, sizeof(float));
+    float *rstd = (float *)calloc((size_t)rows, sizeof(float));
+
+    layernorm_forward(out.data, mean, rstd, x->data, weight->data, bias->data,
+                      rows, cols, 1e-5f);
+    CHECK_MATCHES(&out, expected, ABS_TOL, REL_TOL);
+
+    tensor dx = like(x), dweight = like(weight), dbias = like(bias);
+    layernorm_backward(dx.data, dweight.data, dbias.data, dout->data, x->data,
+                       mean, rstd, weight->data, rows, cols);
+
+    CHECK_MATCHES(&dx, oracle_require(&units, "layernorm.dx"), ABS_TOL, REL_TOL);
+    CHECK_MATCHES(&dweight, oracle_require(&units, "layernorm.dweight"), ABS_TOL, REL_TOL);
+    CHECK_MATCHES(&dbias, oracle_require(&units, "layernorm.dbias"), ABS_TOL, REL_TOL);
+
+    free(mean); free(rstd);
+    tensor_free(&out); tensor_free(&dx);
+    tensor_free(&dweight); tensor_free(&dbias);
+}
+
+static void test_gelu_forward_and_backward(void)
+{
+    const tensor *x = oracle_require(&units, "gelu.x");
+    const tensor *expected = oracle_require(&units, "gelu.out");
+    const tensor *dout = oracle_require(&units, "gelu.dout");
+
+    tensor out = like(expected);
+    gelu_forward(out.data, x->data, x->size);
+    CHECK_MATCHES(&out, expected, ABS_TOL, REL_TOL);
+
+    tensor dx = like(x);
+    gelu_backward(dx.data, dout->data, x->data, x->size);
+    CHECK_MATCHES(&dx, oracle_require(&units, "gelu.dx"), ABS_TOL, REL_TOL);
+
+    tensor_free(&out); tensor_free(&dx);
+}
+
+static void test_softmax_forward_and_backward(void)
+{
+    const tensor *x = oracle_require(&units, "softmax.x");
+    const tensor *expected = oracle_require(&units, "softmax.out");
+    const tensor *dout = oracle_require(&units, "softmax.dout");
+
+    int cols = x->dims[x->ndim - 1];
+    int rows = x->size / cols;
+
+    tensor out = like(expected);
+    softmax_forward(out.data, x->data, rows, cols);
+    CHECK_MATCHES(&out, expected, ABS_TOL, REL_TOL);
+
+    tensor dx = like(x);
+    softmax_backward(dx.data, dout->data, out.data, rows, cols);
+    CHECK_MATCHES(&dx, oracle_require(&units, "softmax.dx"), ABS_TOL, REL_TOL);
+
+    tensor_free(&out); tensor_free(&dx);
+}
+
+static void test_crossentropy_forward_and_backward(void)
+{
+    const tensor *logits = oracle_require(&units, "crossentropy.logits");
+    const tensor *targets = oracle_require(&units, "crossentropy.targets");
+    const tensor *expected_loss = oracle_require(&units, "crossentropy.loss");
+
+    int rows = logits->dims[0], classes = logits->dims[1];
+
+    int *target_indices = (int *)calloc((size_t)rows, sizeof(int));
+    for (int r = 0; r < rows; ++r) {
+        target_indices[r] = (int)targets->data[r];
+    }
+
+    tensor probs = like(logits);
+    float loss = crossentropy_forward(probs.data, logits->data, target_indices,
+                                      rows, classes);
+    CHECK_NEAR(loss, expected_loss->data[0], 1e-5);
+
+    tensor dlogits = like(logits);
+    crossentropy_backward(dlogits.data, probs.data, target_indices, rows, classes);
+    CHECK_MATCHES(&dlogits, oracle_require(&units, "crossentropy.dlogits"),
+                  ABS_TOL, REL_TOL);
+
+    free(target_indices);
+    tensor_free(&probs); tensor_free(&dlogits);
+}
+
+static void test_softmax_survives_logits_that_would_overflow(void)
+{
+    /* expf(89.0f) is infinity in float32. Without the max-subtraction the row
+     * becomes NaN, and because attention logits grow with model width this is
+     * reached by ordinary training rather than by adversarial input. */
+    float logits[4] = { 300.0f, 299.0f, -300.0f, 305.0f };
+    float out[4];
+
+    softmax_forward(out, logits, 1, 4);
+
+    float sum = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        CHECK(out[i] == out[i]);            /* not NaN */
+        CHECK(out[i] >= 0.0f && out[i] <= 1.0f);
+        sum += out[i];
+    }
+    CHECK_NEAR(sum, 1.0f, 1e-6);
+    CHECK(out[3] > out[0]);                 /* the largest logit still wins */
+}
+
+static void test_gradients_accumulate_rather_than_overwrite(void)
+{
+    /* The whole library relies on this: a parameter used twice must collect
+     * gradient from both uses. If any backward function assigned instead of
+     * adding, a shared weight would silently receive only its last
+     * contribution. */
+    const tensor *x = oracle_require(&units, "gelu.x");
+    const tensor *dout = oracle_require(&units, "gelu.dout");
+    const tensor *expected = oracle_require(&units, "gelu.dx");
+
+    tensor once = like(x), twice = like(x);
+    gelu_backward(once.data, dout->data, x->data, x->size);
+    gelu_backward(twice.data, dout->data, x->data, x->size);
+    gelu_backward(twice.data, dout->data, x->data, x->size);
+
+    for (int i = 0; i < x->size; ++i) {
+        CHECK_NEAR(twice.data[i], 2.0f * once.data[i], 1e-5);
+    }
+    CHECK_MATCHES(&once, expected, ABS_TOL, REL_TOL);
+
+    tensor_free(&once); tensor_free(&twice);
+}
+
+static void test_attention_forward_and_backward(void)
+{
+    const tensor *x = oracle_require(&units, "attention.x");
+    const tensor *qkv_w = oracle_require(&units, "attention.qkv_w");
+    const tensor *qkv_b = oracle_require(&units, "attention.qkv_b");
+    const tensor *expected = oracle_require(&units, "attention.out");
+    const tensor *dout = oracle_require(&units, "attention.dout");
+    const tensor *expected_att = oracle_require(&units, "attention.att");
+
+    int B = x->dims[0], T = x->dims[1], C = x->dims[2];
+    int n_head = expected_att->dims[1];
+
+    tensor out = like(expected);
+    tensor qkv = tensor_alloc3(B, T, 3 * C);
+    tensor att = like(expected_att);
+
+    /* Poisoned before the call, not left zeroed.
+     *
+     * These buffers are reused every step in training, so a forward pass that
+     * relies on them arriving clean works exactly once. In particular the
+     * masked upper triangle of att has to be written, not merely left alone --
+     * a fresh calloc'd buffer hides that, and this caught a mutation that
+     * removing the zeroing otherwise survived.
+     */
+    for (int i = 0; i < out.size; ++i) {
+        out.data[i] = -7777.0f;
+    }
+    for (int i = 0; i < qkv.size; ++i) {
+        qkv.data[i] = -7777.0f;
+    }
+    for (int i = 0; i < att.size; ++i) {
+        att.data[i] = -7777.0f;
+    }
+
+    attention_forward(out.data, qkv.data, att.data, x->data,
+                      qkv_w->data, qkv_b->data, B, T, C, n_head);
+
+    CHECK_MATCHES(&out, expected, ABS_TOL, REL_TOL);
+
+    /* The attention weights themselves are compared, not just the output. A
+     * wrong mask or a wrong scale can still produce a plausible output while
+     * the weights are visibly wrong, and this localises that. */
+    CHECK_MATCHES(&att, expected_att, ABS_TOL, REL_TOL);
+
+    tensor dx = like(x), dqkv_w = like(qkv_w), dqkv_b = like(qkv_b);
+    tensor dqkv = like(&qkv), datt = like(&att);
+
+    attention_backward(dx.data, dqkv_w.data, dqkv_b.data, dqkv.data, datt.data,
+                       dout->data, x->data, qkv_w->data, qkv.data, att.data,
+                       B, T, C, n_head);
+
+    CHECK_MATCHES(&dx, oracle_require(&units, "attention.dx"), ABS_TOL, REL_TOL);
+    CHECK_MATCHES(&dqkv_w, oracle_require(&units, "attention.dqkv_w"), ABS_TOL, REL_TOL);
+    CHECK_MATCHES(&dqkv_b, oracle_require(&units, "attention.dqkv_b"), ABS_TOL, REL_TOL);
+
+    /* The attention-weight gradient is compared only on the causal region, and
+     * the reason is worth stating because it looks like a fudge.
+     *
+     * PyTorch forms the full T x T product y = att @ v, so autograd computes
+     * datt[i][j] = sum_d dy[i][d] * v[j][d] for every j -- including j > i,
+     * where att itself is zero. Those entries are real numbers in the oracle
+     * and exactly zero here, because this implementation never forms the upper
+     * triangle at all.
+     *
+     * Neither is wrong: the masked entries are dead. Softmax backward
+     * multiplies each by its own att value, which is zero, so nothing they
+     * contain ever reaches a parameter. The proof is immediately above -- dx,
+     * dqkv_w and dqkv_b all agree with autograd to 1e-5 despite this
+     * difference. Comparing the causal region still catches a wrong softmax
+     * Jacobian, a wrong scale, or a transposed v.
+     */
+    const tensor *expected_datt = oracle_require(&units, "attention.datt");
+    tensor masked = like(expected_datt);
+    for (int b_ = 0; b_ < B; ++b_) {
+        for (int h_ = 0; h_ < n_head; ++h_) {
+            for (int i_ = 0; i_ < T; ++i_) {
+                for (int j_ = 0; j_ <= i_; ++j_) {
+                    size_t k_ = (((size_t)b_ * n_head + h_) * T + i_) * T + j_;
+                    masked.data[k_] = expected_datt->data[k_];
+                }
+            }
+        }
+    }
+    CHECK_MATCHES(&datt, &masked, ABS_TOL, REL_TOL);
+
+    /* And assert the upper triangle really is untouched, so the masking above
+     * cannot hide this implementation writing something there. */
+    for (int b_ = 0; b_ < B; ++b_) {
+        for (int h_ = 0; h_ < n_head; ++h_) {
+            for (int i_ = 0; i_ < T; ++i_) {
+                for (int j_ = i_ + 1; j_ < T; ++j_) {
+                    size_t k_ = (((size_t)b_ * n_head + h_) * T + i_) * T + j_;
+                    CHECK(datt.data[k_] == 0.0f);
+                }
+            }
+        }
+    }
+    tensor_free(&masked);
+
+    tensor_free(&out); tensor_free(&qkv); tensor_free(&att);
+    tensor_free(&dx); tensor_free(&dqkv_w); tensor_free(&dqkv_b);
+    tensor_free(&dqkv); tensor_free(&datt);
+}
+
+static void test_attention_cannot_see_the_future(void)
+{
+    /* The causal mask, asserted directly rather than inferred from the output.
+     *
+     * A model whose mask leaks reads the token it is being asked to predict,
+     * so its training loss collapses toward zero and its generated text is
+     * garbage. That failure looks like success on every metric printed during
+     * training, which is why this is checked structurally.
+     */
+    const int B = 1, T = 5, C = 4, n_head = 2;
+    tensor x = tensor_alloc3(B, T, C);
+    tensor qkv_w = tensor_alloc2(3 * C, C);
+    tensor qkv_b = tensor_alloc(1, (int[]){ 3 * C });
+    tensor out = tensor_alloc3(B, T, C);
+    tensor qkv = tensor_alloc3(B, T, 3 * C);
+    tensor att = tensor_alloc4(B, n_head, T, T);
+
+    for (int i = 0; i < x.size; ++i) {
+        x.data[i] = 0.1f * (float)(i % 7) - 0.3f;
+    }
+    for (int i = 0; i < qkv_w.size; ++i) {
+        qkv_w.data[i] = 0.05f * (float)((i % 11) - 5);
+    }
+    for (int i = 0; i < att.size; ++i) {
+        att.data[i] = 123.0f;       /* must be overwritten, including the mask */
+    }
+
+    attention_forward(out.data, qkv.data, att.data, x.data,
+                      qkv_w.data, qkv_b.data, B, T, C, n_head);
+
+    for (int h = 0; h < n_head; ++h) {
+        for (int i = 0; i < T; ++i) {
+            float row_sum = 0.0f;
+            for (int j = 0; j < T; ++j) {
+                float w = att.data[((size_t)h * T + i) * T + j];
+                if (j > i) {
+                    CHECK(w == 0.0f);       /* strictly future: no weight at all */
+                } else {
+                    CHECK(w > 0.0f);
+                    row_sum += w;
+                }
+            }
+            CHECK_NEAR(row_sum, 1.0f, 1e-5);
+        }
+    }
+
+    /* Position 0 attends only to itself, so its output must be exactly its own
+     * value vector -- a check that does not depend on any other position. */
+    for (int h = 0; h < n_head; ++h) {
+        CHECK_NEAR(att.data[(size_t)h * T * T], 1.0f, 1e-6);
+    }
+
+    tensor_free(&x); tensor_free(&qkv_w); tensor_free(&qkv_b);
+    tensor_free(&out); tensor_free(&qkv); tensor_free(&att);
+}
+
+static void test_editing_a_later_token_cannot_change_an_earlier_output(void)
+{
+    /* The behavioural consequence of the mask, and the one that actually
+     * matters: changing token t must leave outputs 0..t-1 bit-identical. The
+     * structural test above would still pass if the value vectors were mixed
+     * across positions somewhere after the softmax. */
+    const int B = 1, T = 6, C = 4, n_head = 2;
+    tensor x = tensor_alloc3(B, T, C);
+    tensor qkv_w = tensor_alloc2(3 * C, C);
+    tensor qkv_b = tensor_alloc(1, (int[]){ 3 * C });
+    tensor out_a = tensor_alloc3(B, T, C), out_b = tensor_alloc3(B, T, C);
+    tensor qkv = tensor_alloc3(B, T, 3 * C);
+    tensor att = tensor_alloc4(B, n_head, T, T);
+
+    for (int i = 0; i < x.size; ++i) {
+        x.data[i] = 0.2f * (float)(i % 5) - 0.4f;
+    }
+    for (int i = 0; i < qkv_w.size; ++i) {
+        qkv_w.data[i] = 0.05f * (float)((i % 11) - 5);
+    }
+
+    attention_forward(out_a.data, qkv.data, att.data, x.data,
+                      qkv_w.data, qkv_b.data, B, T, C, n_head);
+
+    const int edited = 4;
+    for (int c = 0; c < C; ++c) {
+        x.data[(size_t)edited * C + c] += 17.0f;    /* a large, obvious change */
+    }
+    attention_forward(out_b.data, qkv.data, att.data, x.data,
+                      qkv_w.data, qkv_b.data, B, T, C, n_head);
+
+    for (int i = 0; i < edited; ++i) {
+        for (int c = 0; c < C; ++c) {
+            size_t k = (size_t)i * C + c;
+            CHECK(out_a.data[k] == out_b.data[k]);
+        }
+    }
+    /* And the edited position itself must have moved, or the test proves
+     * nothing about the mask -- only that the input was ignored. */
+    CHECK(out_a.data[(size_t)edited * C] != out_b.data[(size_t)edited * C]);
+
+    tensor_free(&x); tensor_free(&qkv_w); tensor_free(&qkv_b);
+    tensor_free(&out_a); tensor_free(&out_b);
+    tensor_free(&qkv); tensor_free(&att);
+}
+
+void register_op_tests(void)
+{
+    if (!oracle_load(&units, "data/units.bin")) {
+        exit(2);
+    }
+
+    RUN(test_linear_forward_and_backward);
+    RUN(test_layernorm_forward_and_backward);
+    RUN(test_gelu_forward_and_backward);
+    RUN(test_softmax_forward_and_backward);
+    RUN(test_crossentropy_forward_and_backward);
+    RUN(test_softmax_survives_logits_that_would_overflow);
+    RUN(test_gradients_accumulate_rather_than_overwrite);
+    RUN(test_attention_forward_and_backward);
+    RUN(test_attention_cannot_see_the_future);
+    RUN(test_editing_a_later_token_cannot_change_an_earlier_output);
+
+    oracle_free(&units);
+}
+/* AdamW against PyTorch's, over several steps. */
+
+#include "test.h"
+#include "oracle.h"
+#include "../src/optim.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static oracle units;
+
+static void test_adamw_matches_pytorch_over_several_steps(void)
+{
+    /* Four steps, not one. Adam's bias correction is largest at step 1 and
+     * decays from there, so an implementation that omits it entirely is closest
+     * to correct exactly where a one-step test would look. Following it across
+     * steps is what pins it. */
+    const tensor *initial = oracle_require(&units, "adamw.initial");
+
+    tensor params = tensor_alloc(initial->ndim, initial->dims);
+    tensor_copy(&params, initial);
+
+    adamw opt;
+    CHECK(adamw_init(&opt, (size_t)params.size));
+    opt.lr = 1e-2f;
+    opt.beta1 = 0.9f;
+    opt.beta2 = 0.999f;
+    opt.eps = 1e-8f;
+    opt.weight_decay = 0.1f;
+
+    for (int step = 0; step < 4; ++step) {
+        char name[64];
+        snprintf(name, sizeof(name), "adamw.grad%d", step);
+        const tensor *grad = oracle_require(&units, name);
+
+        adamw_step(&opt, params.data, grad->data);
+
+        snprintf(name, sizeof(name), "adamw.after%d", step);
+        CHECK_MATCHES(&params, oracle_require(&units, name), 1e-6f, 1e-4f);
+    }
+
+    adamw_free(&opt);
+    tensor_free(&params);
+}
+
+static void test_bias_correction_is_present(void)
+{
+    /* The first step of Adam moves a parameter by very close to the full
+     * learning rate, whatever the gradient's magnitude: m_hat/sqrt(v_hat) is
+     * g/|g| once both are bias-corrected. Without the correction the same step
+     * is smaller by a factor of about sqrt(1-beta2)/(1-beta1) ~ 0.03, which is
+     * the signature this checks. */
+    float param = 1.0f, grad = 0.5f;
+
+    adamw opt;
+    CHECK(adamw_init(&opt, 1));
+    opt.lr = 0.1f;
+    opt.weight_decay = 0.0f;
+
+    adamw_step(&opt, &param, &grad);
+
+    CHECK_NEAR(1.0f - param, 0.1f, 1e-4);
+    adamw_free(&opt);
+}
+
+static void test_weight_decay_is_decoupled(void)
+{
+    /* With a zero gradient nothing should happen except decay, and the amount
+     * must not depend on any gradient history. An L2-style implementation would
+     * push the decay through the 1/sqrt(v) scaling and produce a much larger
+     * move here. */
+    float param = 2.0f, grad = 0.0f;
+
+    adamw opt;
+    CHECK(adamw_init(&opt, 1));
+    opt.lr = 0.1f;
+    opt.weight_decay = 0.5f;
+
+    adamw_step(&opt, &param, &grad);
+
+    /* 2.0 * (1 - 0.1*0.5) = 1.9 exactly, and no gradient term. */
+    CHECK_NEAR(param, 1.9f, 1e-5);
+    adamw_free(&opt);
+}
+
+static void test_clipping_preserves_direction(void)
+{
+    float grads[4] = { 3.0f, -4.0f, 0.0f, 0.0f };   /* norm exactly 5 */
+
+    float norm = clip_grad_norm(grads, 4, 1.0f);
+
+    CHECK_NEAR(norm, 5.0f, 1e-5);
+    CHECK_NEAR(grads[0], 0.6f, 1e-5);
+    CHECK_NEAR(grads[1], -0.8f, 1e-5);
+    /* The ratio between components is unchanged: only the length moved. */
+    CHECK_NEAR(grads[0] / grads[1], 3.0f / -4.0f, 1e-5);
+}
+
+/* Bit-exact comparison. "Untouched" is a statement about storage, not about
+ * numeric value, and on a toolchain with excess precision the two are not the
+ * same claim -- this test originally failed on `grads[0] == 0.3f` while the
+ * bytes were provably identical, because one side of the comparison had been
+ * widened to 80 bits and the other had not. */
+static int same_bits(float a, float b)
+{
+    return memcmp(&a, &b, sizeof(float)) == 0;
+}
+
+static void test_clipping_leaves_small_gradients_alone(void)
+{
+    float grads[2] = { 0.3f, 0.4f };    /* norm 0.5, under the limit */
+
+    float norm = clip_grad_norm(grads, 2, 1.0f);
+
+    CHECK_NEAR(norm, 0.5f, 1e-5);
+    CHECK(same_bits(grads[0], 0.3f));
+    CHECK(same_bits(grads[1], 0.4f));
+}
+
+void register_optim_tests(void)
+{
+    if (!oracle_load(&units, "data/units.bin")) {
+        exit(2);
+    }
+
+    RUN(test_adamw_matches_pytorch_over_several_steps);
+    RUN(test_bias_correction_is_present);
+    RUN(test_weight_decay_is_decoupled);
+    RUN(test_clipping_preserves_direction);
+    RUN(test_clipping_leaves_small_gradients_alone);
+
+    oracle_free(&units);
+}
+/* Character tokenizer. */
+
+#include "test.h"
+#include "../src/tokenizer.h"
+
+#include <string.h>
+
+static void test_roundtrip_is_lossless(void)
+{
+    const char *text = "Hello, world!\nThe quick brown fox: 12345.";
+    size_t n = strlen(text);
+
+    tokenizer tok;
+    tokenizer_fit(&tok, (const unsigned char *)text, n);
+
+    int tokens[128];
+    size_t count = tokenizer_encode(&tok, (const unsigned char *)text, n, tokens);
+    CHECK(count == n);
+
+    unsigned char back[128];
+    tokenizer_decode(&tok, tokens, count, back);
+    CHECK(memcmp(back, text, n) == 0);
+}
+
+static void test_vocabulary_holds_distinct_bytes_only(void)
+{
+    const char *text = "aaabbbccc";
+
+    tokenizer tok;
+    tokenizer_fit(&tok, (const unsigned char *)text, strlen(text));
+
+    CHECK(tok.vocab_size == 3);
+    /* Ascending byte order, not order of first appearance or frequency, so the
+     * mapping is reproducible from the text alone. */
+    CHECK(tok.to_byte[0] == 'a');
+    CHECK(tok.to_byte[1] == 'b');
+    CHECK(tok.to_byte[2] == 'c');
+}
+
+static void test_token_ids_are_dense(void)
+{
+    /* Bytes far apart in value must still produce contiguous ids: the embedding
+     * table is indexed by token, so a sparse mapping would size it by the
+     * largest byte present rather than by the number of distinct ones. */
+    const char *text = "\n Az~";
+
+    tokenizer tok;
+    tokenizer_fit(&tok, (const unsigned char *)text, strlen(text));
+
+    CHECK(tok.vocab_size == 5);
+    for (int i = 0; i < tok.vocab_size; ++i) {
+        CHECK(tok.to_token[tok.to_byte[i]] == i);
+    }
+}
+
+static void test_unseen_bytes_are_skipped(void)
+{
+    tokenizer tok;
+    tokenizer_fit(&tok, (const unsigned char *)"abc", 3);
+
+    int tokens[8];
+    size_t count = tokenizer_encode(&tok, (const unsigned char *)"axbxc", 5, tokens);
+
+    CHECK(count == 3);
+    CHECK(tokens[0] == 0 && tokens[1] == 1 && tokens[2] == 2);
+}
+
+static void test_handles_every_byte_value(void)
+{
+    unsigned char all[256];
+    for (int i = 0; i < 256; ++i) {
+        all[i] = (unsigned char)i;
+    }
+
+    tokenizer tok;
+    tokenizer_fit(&tok, all, 256);
+    CHECK(tok.vocab_size == 256);
+
+    int tokens[256];
+    size_t count = tokenizer_encode(&tok, all, 256, tokens);
+    CHECK(count == 256);
+
+    unsigned char back[256];
+    tokenizer_decode(&tok, tokens, count, back);
+    CHECK(memcmp(back, all, 256) == 0);
+}
+
+void register_tokenizer_tests(void)
+{
+    RUN(test_roundtrip_is_lossless);
+    RUN(test_vocabulary_holds_distinct_bytes_only);
+    RUN(test_token_ids_are_dense);
+    RUN(test_unseen_bytes_are_skipped);
+    RUN(test_handles_every_byte_value);
+}
+/* Loads a tensor dump produced by ref/reference.py or ref/units.py. */
+
+#ifndef ORACLE_H
+#define ORACLE_H
+
+#include "../src/tensor.h"
+
+#define ORACLE_MAX_TENSORS 256
+#define ORACLE_MAX_NAME 128
+
+typedef struct {
+    char name[ORACLE_MAX_NAME];
+    tensor value;
+} oracle_entry;
+
+typedef struct {
+    oracle_entry entries[ORACLE_MAX_TENSORS];
+    int count;
+} oracle;
+
+int oracle_load(oracle *store, const char *path);
+
+/* Returns NULL when absent. */
+const tensor *oracle_find(const oracle *store, const char *name);
+
+/* Exits with status 2 when absent: a missing tensor means the test and the dump
+ * have drifted apart, which is a broken test rather than a failed comparison. */
+const tensor *oracle_require(const oracle *store, const char *name);
+
+void oracle_free(oracle *store);
+
+#endif /* ORACLE_H */
+/* A test harness in a header, matching the one in attitude-estimation: no
+ * framework, no build system integration, and nothing to install. */
+
+#ifndef TEST_H
+#define TEST_H
+
+#include <stdio.h>
+#include <math.h>
+
+extern int tests_run;
+extern int checks_failed;
+
+#define RUN(fn) do {                                                          \
+    tests_run++;                                                              \
+    fn();                                                                     \
+} while (0)
+
+#define CHECK(cond) do {                                                      \
+    if (!(cond)) {                                                            \
+        checks_failed++;                                                      \
+        printf("  FAILED %s:%d  %s\n", __FILE__, __LINE__, #cond);            \
+    }                                                                         \
+} while (0)
+
+#define CHECK_NEAR(got, want, tol) do {                                       \
+    double _g = (double)(got), _w = (double)(want);                           \
+    if (!(fabs(_g - _w) <= (tol))) {                                          \
+        checks_failed++;                                                      \
+        printf("  FAILED %s:%d  %s = %.9g, expected %.9g (tol %.3g)\n",       \
+               __FILE__, __LINE__, #got, _g, _w, (double)(tol));              \
+    }                                                                         \
+} while (0)
+
+#define CHECK_BELOW(got, limit) do {                                          \
+    double _g = (double)(got);                                                \
+    if (!(_g < (double)(limit))) {                                            \
+        checks_failed++;                                                      \
+        printf("  FAILED %s:%d  %s = %.9g, expected < %.9g\n",                \
+               __FILE__, __LINE__, #got, _g, (double)(limit));                \
+    }                                                                         \
+} while (0)
+
+/* Compares a computed tensor against the oracle's, reporting both error
+ * measures on failure so it is obvious whether the disagreement is a scaling
+ * problem, a layout problem, or float noise. */
+#define CHECK_MATCHES(computed, expected, abs_tol, rel_tol) do {              \
+    tensor_diff _d = tensor_compare((computed), (expected));                  \
+    if (!(_d.max_abs <= (abs_tol) || _d.max_rel <= (rel_tol))) {              \
+        checks_failed++;                                                      \
+        printf("  FAILED %s:%d  %s vs %s: max_abs %.3g (tol %.3g), "          \
+               "max_rel %.3g (tol %.3g) at index %d\n",                       \
+               __FILE__, __LINE__, #computed, #expected,                      \
+               (double)_d.max_abs, (double)(abs_tol),                         \
+               (double)_d.max_rel, (double)(rel_tol), _d.index);              \
+    }                                                                         \
+} while (0)
+
+#endif /* TEST_H */
+"""PyTorch reference model, used as a numerical oracle for the C implementation.
+
+This file is not the project. The project is the C code in src/; this exists so
+that every number the C code produces can be checked against an implementation
+whose correctness is not in question.
+
+The forward pass of a transformer is easy to write and easy to get subtly wrong
+in ways that still train -- a transposed index, a missing scale, a mask applied
+one position late. The backward pass is worse, because an incorrect gradient
+usually still decreases the loss, just slower, and there is nothing to notice.
+So the C implementation is checked layer by layer, forward *and* backward,
+against autograd, rather than being judged on whether its loss goes down.
+
+What gets dumped:
+  - every parameter, so the C model starts from identical weights
+  - the input batch and the loss
+  - every intermediate activation
+  - every parameter gradient and every activation gradient
+
+Tensors are written in a flat binary format that C can read with fread and no
+parsing. Layout is row-major and contiguous, matching the C side exactly.
+"""
+
+import argparse
+import pathlib
+import struct
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Deliberately tiny. The oracle's job is to be exactly checkable, not to be a
+# good language model -- small dimensions make a disagreement easy to localise,
+# and every head, position and channel gets compared individually.
+DEFAULT_CONFIG = dict(
+    vocab_size=65,      # character-level, matching the Shakespeare corpus
+    block_size=16,      # context length
+    n_layer=2,
+    n_head=4,
+    n_embd=32,
+)
+
+MAGIC = b"GPTC"
+VERSION = 1
+
+
+class CausalSelfAttention(nn.Module):
+    """Multi-head causal self-attention.
+
+    Written with explicit reshapes and an explicit mask rather than
+    scaled_dot_product_attention, because the C implementation has to reproduce
+    each step and a fused kernel would hide the intermediates being compared.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        assert config["n_embd"] % config["n_head"] == 0
+        self.n_head = config["n_head"]
+        self.n_embd = config["n_embd"]
+        self.head_dim = self.n_embd // self.n_head
+
+        # One projection producing q, k and v, split afterwards. This is the
+        # usual layout and the C code indexes into it the same way.
+        self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd)
+
+        block = config["block_size"]
+        self.register_buffer(
+            "mask", torch.tril(torch.ones(block, block)).view(1, 1, block, block))
+
+    def forward(self, x):
+        B, T, C = x.shape
+
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+
+        # (B, T, C) -> (B, n_head, T, head_dim)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        # The 1/sqrt(head_dim) scale keeps the logits' variance independent of
+        # head size; without it softmax saturates as dimensions grow and the
+        # gradients vanish.
+        att = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y)
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        n_embd = config["n_embd"]
+        self.c_fc = nn.Linear(n_embd, 4 * n_embd)
+        self.c_proj = nn.Linear(4 * n_embd, n_embd)
+
+    def forward(self, x):
+        # Exact GELU, not the tanh approximation. The two differ by ~1e-3, which
+        # is far above the tolerance the gradient checks run at, so the C side
+        # has to implement the same one.
+        return self.c_proj(F.gelu(self.c_fc(x), approximate="none"))
+
+
+class Block(nn.Module):
+    """Pre-norm residual block: x + attn(ln(x)), then x + mlp(ln(x))."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config["n_embd"])
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config["n_embd"])
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+class GPT(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.wte = nn.Embedding(config["vocab_size"], config["n_embd"])
+        self.wpe = nn.Embedding(config["block_size"], config["n_embd"])
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config["n_layer"])])
+        self.ln_f = nn.LayerNorm(config["n_embd"])
+        self.lm_head = nn.Linear(config["n_embd"], config["vocab_size"], bias=False)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device)
+
+        x = self.wte(idx) + self.wpe(pos)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                   targets.reshape(-1))
+        return logits, loss
+
+
+# --------------------------------------------------------------------------
+# Binary dump
+# --------------------------------------------------------------------------
+
+def write_tensors(path, tensors):
+    """Flat, self-describing, and readable with fread.
+
+    Format:
+        magic "GPTC", uint32 version, uint32 count
+        per tensor:
+            uint32 name_length, name bytes (no terminator)
+            uint32 ndim, ndim x uint32 dims
+            float32 data, row-major, contiguous
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        handle.write(MAGIC)
+        handle.write(struct.pack("<II", VERSION, len(tensors)))
+        for name, tensor in tensors.items():
+            array = tensor.detach().contiguous().float().cpu().numpy()
+            encoded = name.encode("utf-8")
+            handle.write(struct.pack("<I", len(encoded)))
+            handle.write(encoded)
+            handle.write(struct.pack("<I", array.ndim))
+            handle.write(struct.pack(f"<{array.ndim}I", *array.shape))
+            handle.write(array.tobytes(order="C"))
+    return path
+
+
+def collect(model, idx, targets):
+    """One forward and backward pass, capturing everything on the way through.
+
+    Activations are captured with hooks rather than by re-running pieces of the
+    model, so what is dumped is exactly what the loss was computed from.
+    """
+    activations = {}
+
+    def save(name):
+        def hook(_module, _inputs, output):
+            tensor = output[0] if isinstance(output, tuple) else output
+            tensor.retain_grad()
+            activations[name] = tensor
+        return hook
+
+    handles = [model.wte.register_forward_hook(save("act.wte")),
+               model.wpe.register_forward_hook(save("act.wpe")),
+               model.ln_f.register_forward_hook(save("act.ln_f"))]
+    for i, block in enumerate(model.blocks):
+        handles.append(block.ln_1.register_forward_hook(save(f"act.block{i}.ln_1")))
+        handles.append(block.attn.register_forward_hook(save(f"act.block{i}.attn")))
+        handles.append(block.ln_2.register_forward_hook(save(f"act.block{i}.ln_2")))
+        handles.append(block.mlp.c_fc.register_forward_hook(save(f"act.block{i}.mlp.c_fc")))
+        handles.append(block.mlp.register_forward_hook(save(f"act.block{i}.mlp")))
+        handles.append(block.register_forward_hook(save(f"act.block{i}.out")))
+
+    logits, loss = model(idx, targets)
+    logits.retain_grad()
+    model.zero_grad(set_to_none=False)
+    loss.backward()
+
+    for handle in handles:
+        handle.remove()
+
+    out = {}
+    for name, parameter in model.named_parameters():
+        out[f"param.{name}"] = parameter
+        out[f"grad.{name}"] = parameter.grad
+    for name, tensor in activations.items():
+        out[name] = tensor
+        if tensor.grad is not None:
+            out[f"d{name}"] = tensor.grad
+    out["input.idx"] = idx.float()
+    out["input.targets"] = targets.float()
+    out["act.logits"] = logits
+    out["dact.logits"] = logits.grad
+    out["loss"] = loss.reshape(1)
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--out", default=None)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    # float64 would make the oracle more precise than the thing it is checking.
+    # The C side is float32, so the reference is too, and the tolerances below
+    # are set against float32 accumulation error rather than against exactness.
+    torch.set_default_dtype(torch.float32)
+
+    config = dict(DEFAULT_CONFIG)
+    model = GPT(config)
+    model.eval()   # no dropout anywhere, but pinned so the dump is reproducible
+
+    T = config["block_size"]
+    idx = torch.randint(0, config["vocab_size"], (args.batch, T))
+    targets = torch.randint(0, config["vocab_size"], (args.batch, T))
+
+    tensors = collect(model, idx, targets)
+
+    here = pathlib.Path(__file__).parent
+    out = pathlib.Path(args.out) if args.out else here.parent / "data" / "oracle.bin"
+    write_tensors(out, tensors)
+
+    total = sum(p.numel() for p in model.parameters())
+    print(f"wrote {out}")
+    print(f"  config      {config}")
+    print(f"  parameters  {total:,}")
+    print(f"  batch       {args.batch} x {T}")
+    print(f"  loss        {tensors['loss'].item():.8f}")
+    print(f"  tensors     {len(tensors)}")
+    print(f"  bytes       {out.stat().st_size:,}")
+
+
+if __name__ == "__main__":
+    main()
+"""Per-operation oracle: one isolated case per op, forward and backward.
+
+The full-model dump in reference.py catches disagreement but does not localise
+it. A wrong LayerNorm gradient and a wrong attention gradient both show up as
+"the loss gradient is off", and working backwards from that is slow. These cases
+pin each operation on its own, with inputs chosen to exercise the parts that are
+easy to get wrong.
+
+Every case supplies an incoming gradient drawn at random rather than ones. A
+gradient of all-ones hides bugs: any term that should be scaled by the incoming
+gradient still produces the right answer when that gradient is 1, so a missing
+multiplication survives the test.
+"""
+
+import pathlib
+
+import torch
+import torch.nn.functional as F
+
+from reference import write_tensors
+
+SEED = 4242
+
+
+def case(name, inputs, output, extra_grads=()):
+    """Runs backward and returns the tensors this case contributes."""
+    incoming = torch.randn_like(output)
+    output.backward(incoming)
+
+    out = {f"{name}.out": output, f"{name}.dout": incoming}
+    for key, tensor in inputs.items():
+        out[f"{name}.{key}"] = tensor
+        if tensor.grad is not None:
+            out[f"{name}.d{key}"] = tensor.grad
+    for key, tensor in extra_grads:
+        out[f"{name}.{key}"] = tensor
+    return out
+
+
+def leaf(*shape, scale=1.0):
+    return (torch.randn(*shape) * scale).requires_grad_(True)
+
+
+def build():
+    torch.manual_seed(SEED)
+    tensors = {}
+
+    # ---- LayerNorm -------------------------------------------------------
+    # Inputs are scaled well away from unit variance. A normalisation whose
+    # backward forgets the mean or variance terms still looks right when the
+    # input is already standardised, which is exactly what randn gives.
+    x = leaf(3, 5, 8, scale=4.0)
+    weight = leaf(8)
+    bias = leaf(8)
+    tensors.update(case("layernorm",
+                        {"x": x, "weight": weight, "bias": bias},
+                        F.layer_norm(x, (8,), weight, bias, eps=1e-5)))
+
+    # ---- GELU ------------------------------------------------------------
+    # Spans the saturating tails and the region near zero where the exact and
+    # tanh-approximate forms differ most.
+    x = leaf(4, 16, scale=3.0)
+    tensors.update(case("gelu", {"x": x}, F.gelu(x, approximate="none")))
+
+    # ---- Softmax, last axis ---------------------------------------------
+    # The Jacobian is dense: every output depends on every input in the row.
+    # An implementation that only handles the diagonal term passes a
+    # sum-reduced test and fails this one.
+    x = leaf(3, 7, scale=2.0)
+    tensors.update(case("softmax", {"x": x}, F.softmax(x, dim=-1)))
+
+    # ---- Linear ----------------------------------------------------------
+    # Non-square and non-matching dims throughout, so a transposed matmul
+    # cannot silently produce a correctly shaped answer.
+    x = leaf(6, 5)
+    weight = leaf(9, 5)      # torch stores linear weight as (out, in)
+    bias = leaf(9)
+    tensors.update(case("linear",
+                        {"x": x, "weight": weight, "bias": bias},
+                        F.linear(x, weight, bias)))
+
+    # ---- Causal self-attention ------------------------------------------
+    # Two heads and four positions: small enough to inspect by hand, large
+    # enough that the mask, the head split and the scale all matter. A missing
+    # mask shows up here and nowhere else.
+    B, T, n_head, head_dim = 2, 4, 2, 3
+    C = n_head * head_dim
+    x = leaf(B, T, C)
+    qkv_w = leaf(3 * C, C)
+    qkv_b = leaf(3 * C)
+
+    qkv = F.linear(x, qkv_w, qkv_b)
+    q, k, v = qkv.split(C, dim=2)
+    q = q.view(B, T, n_head, head_dim).transpose(1, 2)
+    k = k.view(B, T, n_head, head_dim).transpose(1, 2)
+    v = v.view(B, T, n_head, head_dim).transpose(1, 2)
+
+    att = (q @ k.transpose(-2, -1)) / (head_dim ** 0.5)
+    mask = torch.tril(torch.ones(T, T)).view(1, 1, T, T)
+    att = att.masked_fill(mask == 0, float("-inf"))
+    att = F.softmax(att, dim=-1)
+    att.retain_grad()
+    y = (att @ v).transpose(1, 2).contiguous().view(B, T, C)
+
+    tensors.update(case("attention",
+                        {"x": x, "qkv_w": qkv_w, "qkv_b": qkv_b}, y,
+                        extra_grads=[("att", att)]))
+    tensors["attention.datt"] = att.grad
+
+    # ---- Cross entropy ---------------------------------------------------
+    # Reduced to a scalar, so this one seeds its own backward rather than
+    # taking an incoming gradient.
+    logits = leaf(5, 11, scale=2.0)
+    targets = torch.randint(0, 11, (5,))
+    loss = F.cross_entropy(logits, targets)
+    loss.backward()
+    tensors["crossentropy.logits"] = logits
+    tensors["crossentropy.targets"] = targets.float()
+    tensors["crossentropy.loss"] = loss.reshape(1)
+    tensors["crossentropy.dlogits"] = logits.grad
+
+    # ---- AdamW ------------------------------------------------------------
+    # Several steps, not one. The bias-correction terms decay with the step
+    # count, so a single step cannot distinguish a correct implementation from
+    # one that omits them -- at t=1 the correction is largest and most of the
+    # plausible errors still land close. Five steps separates them.
+    #
+    # A fixed gradient would also hide errors in the second moment, so each step
+    # gets a different one.
+    torch.manual_seed(SEED + 1)
+    param = torch.randn(24) * 0.5
+    grads = [torch.randn(24) * 0.1 for _ in range(5)]
+
+    tensors["adamw.initial"] = param.clone()
+    for i, g in enumerate(grads):
+        tensors[f"adamw.grad{i}"] = g
+
+    work = param.clone().requires_grad_(True)
+    optimizer = torch.optim.AdamW([work], lr=1e-2, betas=(0.9, 0.95),
+                                  eps=1e-8, weight_decay=0.1)
+    for i, g in enumerate(grads):
+        optimizer.zero_grad()
+        work.grad = g.clone()
+        optimizer.step()
+        tensors[f"adamw.after{i}"] = work.detach().clone()
+
+    # ---- AdamW, several steps ------------------------------------------
+    # One step is not enough to pin this. Adam's bias correction is largest at
+    # step 1 and decays, so an implementation that omits it entirely is closest
+    # to correct exactly where a single-step test would look. Running four steps
+    # and dumping each lets the test follow the correction as it fades.
+    torch.manual_seed(SEED + 1)
+    weight = torch.randn(6, 4, requires_grad=True)
+    start = weight.detach().clone()
+
+    optimizer = torch.optim.AdamW([weight], lr=1e-2, betas=(0.9, 0.999),
+                                  eps=1e-8, weight_decay=0.1)
+
+    tensors["adamw.initial"] = start
+    for step in range(4):
+        # A fixed, deterministic "gradient" rather than a real one: this checks
+        # the update rule, and coupling it to a model would only add a way for
+        # the test to fail for an unrelated reason.
+        grad = torch.sin(start * float(step + 1)) + 0.1 * float(step)
+        weight.grad = grad.clone()
+        tensors[f"adamw.grad{step}"] = grad
+        optimizer.step()
+        tensors[f"adamw.after{step}"] = weight.detach().clone()
+
+    return tensors
+
+
+def main():
+    tensors = build()
+    out = pathlib.Path(__file__).parent.parent / "data" / "units.bin"
+    write_tensors(out, tensors)
+
+    print(f"wrote {out}")
+    names = sorted({n.split(".")[0] for n in tensors})
+    print(f"  cases    {len(names)}: {', '.join(names)}")
+    print(f"  tensors  {len(tensors)}")
+    print(f"  bytes    {out.stat().st_size:,}")
+
+
+if __name__ == "__main__":
+    main()
+/* Trains the model on a text file.
+ *
+ * Lives outside src/ for the same reason bench/ does in the attitude-estimation
+ * project: the library has no file I/O and no stdio, so the same objects compile
+ * for a freestanding target. Everything that touches a file is here.
+ *
+ * The validation split is the point of the whole program. A language model can
+ * drive its training loss arbitrarily low by memorising, and a character model
+ * on a small corpus will do exactly that, so training loss alone says nothing
+ * about whether it learned the language. The split is contiguous rather than
+ * random: sampling held-out windows at random from the same text leaves them
+ * overlapping their training neighbours by up to block_size - 1 characters,
+ * which leaks the answer and produces a validation curve that tracks the
+ * training curve no matter how badly the model overfits.
+ */
+
+#include "src/model.h"
+#include "src/optim.h"
+#include "src/tokenizer.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+static double seconds_now(void)
+{
+    return (double)clock() / (double)CLOCKS_PER_SEC;
+}
+
+static unsigned char *read_file(const char *path, size_t *length)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size <= 0) {
+        fclose(f);
+        return NULL;
+    }
+
+    unsigned char *buffer = (unsigned char *)malloc((size_t)size);
+    if (!buffer || fread(buffer, 1, (size_t)size, f) != (size_t)size) {
+        free(buffer);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *length = (size_t)size;
+    return buffer;
+}
+
+/* Draws a batch of (input, target) windows. The target is the input shifted one
+ * position, so every position in the sequence supplies a prediction rather than
+ * only the last -- which is what makes a single forward pass worth B*T training
+ * signals instead of B. */
+static void sample_batch(const int *tokens, size_t count, int B, int T,
+                         int *idx, int *targets, unsigned *rng)
+{
+    for (int b = 0; b < B; ++b) {
+        *rng = *rng * 1103515245u + 12345u;
+        size_t start = (size_t)((*rng >> 8) % (count - (size_t)T - 1));
+
+        for (int t = 0; t < T; ++t) {
+            idx[b * T + t] = tokens[start + (size_t)t];
+            targets[b * T + t] = tokens[start + (size_t)t + 1];
+        }
+    }
+}
+
+/* Mean loss over a fixed set of batches, drawn from a fixed seed so the number
+ * is comparable across evaluations rather than moving with the sample. */
+static float evaluate(gpt_model *model, const int *tokens, size_t count,
+                      int B, int T, int batches, int *idx, int *targets)
+{
+    unsigned rng = 12345u;
+    float total = 0.0f;
+
+    for (int i = 0; i < batches; ++i) {
+        sample_batch(tokens, count, B, T, idx, targets, &rng);
+        total += gpt_forward(model, idx, targets, T);
+    }
+    return total / (float)batches;
+}
+
+static void print_sample(gpt_model *model, const tokenizer *tok,
+                         const int *tokens, int T, unsigned *rng)
+{
+    int prompt[1] = { tokens[0] };
+    int *generated = (int *)malloc((size_t)(T + 200) * sizeof(int));
+    unsigned char *text = (unsigned char *)malloc((size_t)(T + 200) + 1);
+
+    int n = gpt_generate(model, prompt, 1, generated, 200, 0.8f, rng);
+    tokenizer_decode(tok, generated, (size_t)n, text);
+    text[n] = '\0';
+
+    printf("  ------------------------------------------------------------\n");
+    for (int i = 0; i < n; ++i) {
+        putchar(text[i] == '\n' ? ' ' : text[i]);
+    }
+    printf("\n  ------------------------------------------------------------\n");
+
+    free(generated);
+    free(text);
+}
+
+int main(int argc, char **argv)
+{
+    const char *path = (argc > 1) ? argv[1] : "data/input.txt";
+    int steps = (argc > 2) ? atoi(argv[2]) : 500;
+
+    size_t file_length = 0;
+    unsigned char *text = read_file(path, &file_length);
+    if (!text) {
+        fprintf(stderr, "cannot read %s\n", path);
+        fprintf(stderr, "  run: make data/input.txt\n");
+        return 1;
+    }
+
+    tokenizer tok;
+    tokenizer_fit(&tok, text, file_length);
+
+    int *tokens = (int *)malloc(file_length * sizeof(int));
+    size_t token_count = tokenizer_encode(&tok, text, file_length, tokens);
+    free(text);
+
+    /* Contiguous split, last 10% held out. */
+    size_t train_count = token_count * 9 / 10;
+    size_t val_count = token_count - train_count;
+    const int *val_tokens = tokens + train_count;
+
+    gpt_config config;
+    config.vocab_size = tok.vocab_size;
+    config.block_size = 64;
+    config.n_layer = 3;
+    config.n_head = 4;
+    config.n_embd = 96;
+
+    const int B = 16, T = config.block_size;
+
+    gpt_model model;
+    if (!gpt_init(&model, config, B)) {
+        fprintf(stderr, "out of memory\n");
+        return 1;
+    }
+    gpt_randomize(&model, 1337u);
+
+    adamw opt;
+    if (!adamw_init(&opt, model.params.count)) {
+        fprintf(stderr, "out of memory\n");
+        return 1;
+    }
+    opt.lr = 1e-3f;
+
+    int *idx = (int *)malloc((size_t)B * T * sizeof(int));
+    int *targets = (int *)malloc((size_t)B * T * sizeof(int));
+
+    printf("\ngpt-in-c\n");
+    printf("  corpus      %s, %zu bytes, %d distinct characters\n",
+           path, file_length, tok.vocab_size);
+    printf("  split       %zu train / %zu validation tokens\n",
+           train_count, val_count);
+    printf("  model       %d layers, %d heads, width %d, context %d\n",
+           config.n_layer, config.n_head, config.n_embd, config.block_size);
+    printf("  parameters  %zu\n", model.params.count);
+    printf("  batch       %d x %d = %d tokens per step\n", B, T, B * T);
+    printf("  steps       %d\n\n", steps);
+
+    /* Before training, the model should be at the entropy of a uniform
+     * distribution over the vocabulary: -log(1/V). Printing it makes the first
+     * loss meaningful rather than an unanchored number, and a starting loss far
+     * from it means the initialisation is wrong. */
+    printf("  expected initial loss  %.4f  (ln %d)\n\n",
+           (double)logf((float)tok.vocab_size), tok.vocab_size);
+
+    unsigned rng = 42u;
+    double start_time = seconds_now();
+    double train_seconds = 0.0;
+    long tokens_seen = 0;
+
+    for (int step = 1; step <= steps; ++step) {
+        double step_start = seconds_now();
+
+        sample_batch(tokens, train_count, B, T, idx, targets, &rng);
+
+        float loss = gpt_forward(&model, idx, targets, T);
+        gpt_zero_grad(&model);
+        gpt_backward(&model, idx, targets, T);
+
+        float norm = clip_grad_norm(model.grads.storage, model.grads.count, 1.0f);
+        adamw_step(&opt, model.params.storage, model.grads.storage);
+
+        train_seconds += seconds_now() - step_start;
+        tokens_seen += B * T;
+
+        if (step == 1 || step % 50 == 0 || step == steps) {
+            float val = evaluate(&model, val_tokens, val_count, B, T, 10,
+                                 idx, targets);
+            printf("  step %5d   train %.4f   val %.4f   |grad| %.3f   "
+                   "%.0f tok/s\n",
+                   step, (double)loss, (double)val, (double)norm,
+                   (double)tokens_seen / train_seconds);
+        }
+    }
+
+    printf("\n  %d steps in %.1f s, %.0f tokens/s\n",
+           steps, seconds_now() - start_time,
+           (double)tokens_seen / train_seconds);
+
+    printf("\n  sample at temperature 0.8:\n");
+    print_sample(&model, &tok, tokens, T, &rng);
+
+    free(idx); free(targets); free(tokens);
+    adamw_free(&opt);
+    gpt_free(&model);
+    return 0;
+}
+# GPT in C
+
+A transformer implemented from scratch in dependency-free C99 — forward pass
+*and* hand-derived backward pass — with PyTorch used as a numerical oracle
+rather than as a framework.
+
+The forward pass of a transformer is short enough to write from the paper. The
+backward pass is where the understanding is, and autograd makes it free, so an
+implementation that writes only the forward half demonstrates nothing that
+reading the paper would not. Every gradient here is derived by hand and checked
+against `torch.autograd` element by element.
+
+**Why an oracle.** An incorrect gradient almost never announces itself. It
+usually still decreases the loss, just more slowly, so "it trains" is not
+evidence of correctness — it is the failure mode. Each operation is therefore
+pinned against autograd on its own, before any of it is assembled into a model.
+
+---
+
+## Status
+
+Early. Working so far:
+
+- `src/tensor.{h,c}` — flat row-major float32 tensors, no strides or broadcasting
+- `src/ops.{h,c}` — linear, LayerNorm, GELU, softmax, fused softmax
+  cross-entropy, and multi-head causal self-attention, each forward and backward
+- `src/model.{h,c}` — the assembled GPT: embeddings, pre-norm blocks, LM head,
+  forward and backward
+- `src/optim.{h,c}` — AdamW with decoupled weight decay, and gradient clipping
+- `ref/reference.py` — the PyTorch model, and a full forward/backward dump
+- `ref/units.py` — one isolated oracle case per operation
+- `tests/` — 20 tests, no framework
+
+The full model agrees with PyTorch on the loss, the logits, and **every one of
+its 30,144 parameter gradients**, to 2e-5 absolute or 2e-4 relative.
+
+Not yet built: the tokenizer and the training loop.
+
+## Verification
+
+Every operation is compared against PyTorch at absolute 1e-5 or relative 1e-4,
+either sufficing. Both sides are float32 and accumulate in different orders, so
+exact agreement is not available; these bounds are about two orders of magnitude
+tighter than any real bug produces.
+
+A test suite that passes proves nothing on its own, so the suite is checked by
+breaking the implementation on purpose. **Thirty-five mutations, thirty-five
+caught** — though not all on the first attempt; see below.
+
+Ten of those target the assembled model rather than individual operations:
+dropping either residual connection, dropping the position embedding, post-norm
+instead of pre-norm ordering, losing either residual path in the backward pass,
+walking the layers forward instead of in reverse, and using the wrong
+LayerNorm's saved statistics.
+
+| Mutation | Result |
+|---|---|
+| LayerNorm backward, drop both mean-correction terms | caught |
+| LayerNorm backward, drop only the variance term | caught |
+| LayerNorm backward, drop only the mean term | caught |
+| LayerNorm forward, forget the weight scale | caught |
+| GELU backward, drop the density term | caught |
+| GELU forward, tanh approximation instead of erf | caught |
+| Softmax backward, keep only the diagonal term | caught |
+| Softmax forward, remove the max subtraction | caught (8 checks) |
+| Linear backward, transpose the weight gradient | caught |
+| Linear backward, forget the bias gradient | caught |
+| Cross-entropy backward, forget the 1/rows scale | caught |
+| Cross-entropy backward, forget to subtract the target | caught |
+| Attention, leak the causal mask | caught |
+| Attention, transpose q and k in the score | caught |
+| Attention, drop the 1/sqrt(head_dim) scale, forward | caught |
+| Attention, drop the 1/sqrt(head_dim) scale, backward | caught |
+| Attention backward, drop the softmax dot term | caught |
+| Attention backward, swap the dq and dk accumulation | caught |
+| Attention backward, index dv by att[j][i] | caught |
+| Attention, forget to zero the masked weights | caught *(2nd attempt)* |
+| Attention, forget to zero the output accumulator | caught *(2nd attempt)* |
+| AdamW, omit the bias correction | caught |
+| AdamW, couple weight decay into the gradient | caught |
+
+The LayerNorm ones matter most. Its backward pass has two terms that exist only
+because the mean and variance are themselves functions of every element in the
+row, and dropping them is the single most common error in a hand-written
+transformer. A model with that bug still trains.
+
+### A second, independent check on the gradients
+
+The oracle is precise but shares an assumption with the code it checks: both
+implement the same architecture from the same description, so a *misreading of
+the architecture* would be reproduced on both sides and agree perfectly.
+
+So the gradients are also checked against the definition of a derivative —
+perturb a parameter, measure how the loss actually moves, compare. That check
+knows nothing about transformers and cannot share the error.
+
+It is deliberately coarse. A central difference has truncation error growing
+with `eps²`, while float32 cancellation error grows as the loss difference
+shrinks, and the two squeeze the usable range of `eps` from both sides. The
+magnitude floor is derived rather than guessed: the difference moves the loss by
+about `2·eps·grad`, float32 resolves a loss near 4.3 to roughly 5e-7, and
+requiring several hundred times that gives `grad > 1e-2`. Below it the quotient
+is mostly noise — a gradient of 1e-3 shifts the loss by 2e-5, which carries
+barely two significant digits, and comparing that at 5% fails on rounding alone.
+
+Setting the floor at 1e-3 initially produced exactly that: one sampled parameter
+5.9% off, with PyTorch already confirming the same gradient to 2e-5. The fix was
+the arithmetic above, not a wider tolerance.
+
+### Two mutations that survived, and what they exposed
+
+Both concerned buffers the forward pass is supposed to overwrite. The tests
+allocated them with `calloc` and so received clean zeroed memory every time,
+which is exactly the state a training loop never provides — those buffers are
+reused every step. Forgetting to zero the masked upper triangle of the attention
+weights, or to reset the output accumulator, therefore worked on the first
+forward pass and corrupted every one after it.
+
+The tests now **poison every scratch buffer** with a sentinel before calling the
+forward pass. Both mutations are caught, and it is worth noting that neither was
+found by comparing against PyTorch: autograd was in perfect agreement, because
+the oracle harness had the same clean-buffer assumption. Only deliberately
+breaking the code surfaced them.
+
+### What the masked attention gradient disagrees on
+
+`datt` is the one tensor where this implementation and PyTorch legitimately
+differ. Autograd forms the full `T x T` product, so it computes a nonzero
+gradient for masked positions, where the attention weight is itself zero. This
+implementation never forms the upper triangle at all.
+
+Both are correct, because those entries are dead: softmax backward multiplies
+each by its own attention weight, which is zero, so nothing they contain ever
+reaches a parameter. The evidence is that `dx`, `dqkv_w` and `dqkv_b` all agree
+with autograd to 1e-5 regardless. The test compares the causal region and
+separately asserts the upper triangle is untouched, rather than quietly widening
+a tolerance until the disagreement fits.
+
+### Design notes
+
+**Gradients accumulate, they do not overwrite.** A parameter used in several
+places — tied embeddings, or a weight shared across positions — must collect
+gradient from each use, and that only works if every backward function adds.
+`test_gradients_accumulate_rather_than_overwrite` calls one twice and checks the
+result doubles. The cost is that forgetting to zero produces a slow, plausible
+divergence rather than a crash, so the training loop zeroes in exactly one place.
+
+**Cross-entropy is fused with the softmax.** Their composition differentiates to
+`(p - onehot) / n`, which avoids both the division by a near-zero probability and
+the cancellation that a separate softmax and log produce for a confident wrong
+prediction.
+
+**Softmax subtracts the row maximum.** Mathematically a no-op, numerically
+essential: `expf(89.0f)` is already infinity in float32, and attention logits
+reach that range through ordinary training rather than adversarial input.
+`test_softmax_survives_logits_that_would_overflow` uses logits of ±300.
+
+**LayerNorm takes variance from centred values**, not `E[x²] − E[x]²`. The
+latter is one pass cheaper and subtracts two large nearly-equal numbers, losing
+most of the significand when the mean is large relative to the spread.
+
+**Causality is enforced by not computing the future, not by masking it.** The
+scores above the diagonal are never formed, which halves the work and makes a
+leak structurally impossible rather than dependent on remembering to add `-inf`.
+The entries are still written as zero, because the backward pass reads whole
+rows. Two tests cover it: one asserts the weights are zero above the diagonal
+and each row sums to one, the other edits a later token and checks that every
+earlier output is bit-identical — the behavioural consequence, which the
+structural check alone would not catch if values were mixed after the softmax.
+
+**A leaking causal mask is the failure that looks most like success.** The model
+reads the token it is being asked to predict, so training loss collapses toward
+zero while generated text stays garbage. Every number printed during training
+improves.
+
+**Exact GELU, not the tanh approximation.** The two differ by about 1e-3, three
+orders of magnitude above the tolerance these tests run at.
+
+**The build forces real float32 arithmetic**, with `-msse2 -mfpmath=sse`. This
+is a 32-bit toolchain, where gcc defaults to the x87 unit and `FLT_EVAL_METHOD`
+is 2: every float expression is evaluated in 80 bits and rounded to 32 only when
+stored. That makes the library quietly more accurate than the float32 it claims
+to be, hides error a real single-precision FPU would show, and — the symptom
+that exposed it — breaks exact comparisons, since a value in memory and the same
+value in a register are not bit-identical. A clipping test failed on
+`grads[0] == 0.3f` while the bytes were provably unchanged.
+
+The targets this code is written for, Cortex-M and Xtensa, have genuine 32-bit
+FPUs and no excess precision, so the host build is pinned to match them. Every
+gradient still agrees with PyTorch to 2e-5 without the extended-precision
+crutch, which is a stronger result than the one measured before.
+
+**The oracle is float32, not float64.** A float64 reference would be more
+precise than the thing it is checking, and the tolerances would then be
+measuring the C side's accumulation order rather than its correctness.
+
+**No file I/O in `src/`.** The library has no stdio dependency, so the same
+objects compile for a freestanding target. Loading oracle dumps lives in
+`tests/`.
+
+## Layout
+
+```
+src/        tensor.{h,c}  ops.{h,c}                    the library
+ref/        reference.py  units.py                     PyTorch oracle
+tests/      oracle.{h,c}  test.h  test_ops.c           host only
+data/       generated oracle dumps, not committed
+```
+
+## Build and run
+
+Requires a C99 compiler, `make`, and Python 3 with PyTorch for the oracle.
+
+```
+make oracle     # regenerate data/*.bin from ref/*.py
+make test       # 10 tests
+```
+
+The oracle dumps are generated rather than committed — they are derived from
+`ref/*.py`, and a binary blob in the history is something nobody can review.
+
+## License
+
+MIT.

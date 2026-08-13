@@ -229,11 +229,17 @@ void gpt_randomize(gpt_model *model, unsigned seed)
 
 float gpt_forward(gpt_model *model, const int *idx, const int *targets, int T)
 {
+    return gpt_forward_batch(model, idx, targets, model->acts.batch, T);
+}
+
+float gpt_forward_batch(gpt_model *model, const int *idx, const int *targets,
+                        int B, int T)
+{
     gpt_config c = model->config;
     gpt_params *p = &model->params;
     gpt_activations *a = &model->acts;
 
-    int B = a->batch, C = c.n_embd, L = c.n_layer, H = c.n_head, V = c.vocab_size;
+    int C = c.n_embd, L = c.n_layer, H = c.n_head, V = c.vocab_size;
     size_t BTC = (size_t)B * T * C;
     size_t BT = (size_t)B * T;
 
@@ -448,4 +454,73 @@ void gpt_backward(gpt_model *model, const int *idx, const int *targets, int T)
             }
         }
     }
+}
+
+/* ------------------------------------------------------------------------
+ * Sampling
+ * ------------------------------------------------------------------------ */
+
+int gpt_generate(gpt_model *model, const int *prompt, int prompt_len,
+                 int *out, int max_new, float temperature, unsigned *rng)
+{
+    gpt_config c = model->config;
+    int V = c.vocab_size, T_max = c.block_size;
+
+    int count = prompt_len < T_max ? prompt_len : T_max;
+    for (int i = 0; i < count; ++i) {
+        out[i] = prompt[i];
+    }
+
+    for (int step = 0; step < max_new; ++step) {
+        /* Only the trailing block_size tokens are visible. This is a real
+         * limitation of the model rather than an implementation shortcut: the
+         * position embedding table has exactly block_size rows. */
+        int start = count > T_max ? count - T_max : 0;
+        int window = count - start;
+
+        gpt_forward_batch(model, out + start, NULL, 1, window);
+
+        /* Only the last position predicts the next token; the earlier ones
+         * predict tokens already present. */
+        const float *logits = model->acts.logits + (size_t)(window - 1) * V;
+
+        int next = 0;
+        if (temperature <= 0.0f) {
+            for (int v = 1; v < V; ++v) {
+                if (logits[v] > logits[next]) {
+                    next = v;
+                }
+            }
+        } else {
+            /* Softmax over the scaled logits, with the usual max subtraction,
+             * then an inverse-CDF draw. */
+            float maximum = logits[0];
+            for (int v = 1; v < V; ++v) {
+                if (logits[v] > maximum) {
+                    maximum = logits[v];
+                }
+            }
+
+            float sum = 0.0f;
+            for (int v = 0; v < V; ++v) {
+                sum += expf((logits[v] - maximum) / temperature);
+            }
+
+            *rng = *rng * 1103515245u + 12345u;
+            float target = ((float)((*rng >> 16) & 0x7fff) / 32768.0f) * sum;
+
+            float running = 0.0f;
+            next = V - 1;   /* fallback if rounding leaves target just above sum */
+            for (int v = 0; v < V; ++v) {
+                running += expf((logits[v] - maximum) / temperature);
+                if (running >= target) {
+                    next = v;
+                    break;
+                }
+            }
+        }
+
+        out[count++] = next;
+    }
+    return count;
 }

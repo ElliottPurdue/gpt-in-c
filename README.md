@@ -27,14 +27,43 @@ Early. Working so far:
 - `src/model.{h,c}` — the assembled GPT: embeddings, pre-norm blocks, LM head,
   forward and backward
 - `src/optim.{h,c}` — AdamW with decoupled weight decay, and gradient clipping
+- `src/tokenizer.{h,c}` — character-level vocabulary, encode and decode
+- `train.c` — data loading, batching, the training loop, and sampling
 - `ref/reference.py` — the PyTorch model, and a full forward/backward dump
 - `ref/units.py` — one isolated oracle case per operation
-- `tests/` — 20 tests, no framework
+- `tests/` — 25 tests, no framework
 
 The full model agrees with PyTorch on the loss, the logits, and **every one of
 its 30,144 parameter gradients**, to 2e-5 absolute or 2e-4 relative.
 
-Not yet built: the tokenizer and the training loop.
+**It trains.** On the repository's own source and prose as a corpus — 146,501
+bytes, 105 distinct characters — a 3-layer, width-96, context-64 model of
+362,016 parameters:
+
+```
+  expected initial loss  4.6540  (ln 105)
+
+  step     1   train 4.6442   val 4.3820   |grad| 4.510
+  step    50   train 2.8486   val 3.0872   |grad| 1.382
+  step   100   train 2.5643   val 2.9018   |grad| 0.969
+  step   200   train 2.5997   val 2.8195   |grad| 1.086
+  step   300   train 2.0048   val 2.7374   |grad| 1.505
+
+  300 steps in 187.0 s, 1780 tokens/s
+```
+
+The first loss lands on `ln(vocab_size)` to three decimal places, which is where
+an untrained model has to start: uniform over the vocabulary. Printing the
+expected value next to it turns the first step into a check on the
+initialisation rather than an unanchored number.
+
+By step 300 training loss has pulled away from validation — 2.00 against 2.74 —
+which is overfitting beginning, and expected with 362K parameters against 132K
+training tokens. It is visible only because the validation split is contiguous;
+see below.
+
+Not yet built: a blocked and threaded matmul. At 1,780 tokens/s the naive triple
+loop is the entire cost, and that is the next measurement worth taking.
 
 ## Verification
 
@@ -193,6 +222,19 @@ crutch, which is a stronger result than the one measured before.
 **The oracle is float32, not float64.** A float64 reference would be more
 precise than the thing it is checking, and the tolerances would then be
 measuring the C side's accumulation order rather than its correctness.
+
+**The validation split is contiguous, not random.** A character model on a small
+corpus will memorise, so training loss alone says nothing about whether it
+learned anything. But sampling held-out windows at random from the same text
+leaves each one overlapping its training neighbours by up to `block_size - 1`
+characters, which leaks the answer: validation then tracks training no matter how
+badly the model overfits, and the metric that exists to detect memorisation is
+the one memorisation defeats. The last 10% is held out as a single block.
+
+**The corpus is the repository itself.** Its own source, tests and prose,
+concatenated by a Makefile target. No download, fully reproducible, and C gives a
+character model plenty of structure to learn — matched braces, indentation,
+comment delimiters, identifier conventions.
 
 **No file I/O in `src/`.** The library has no stdio dependency, so the same
 objects compile for a freestanding target. Loading oracle dumps lives in

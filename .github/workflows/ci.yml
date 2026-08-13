@@ -101,17 +101,45 @@ jobs:
       - name: Train for 20 steps
         run: ./build/train data/input.txt 20 | tee /tmp/train.log
 
-      - name: Check the starting loss and that it decreases
+      - name: Show the training log
+        run: cat /tmp/train.log
+
+      # Split one assertion per step. Action logs need authentication to read,
+      # but the step list does not, so a failure names itself.
+      - name: Assert the log parsed
+        run: |
+          python - <<'EOF'
+          import re, sys
+          log = open("/tmp/train.log").read()
+          for name, pattern in [("expected", r"expected initial loss\s+([\d.]+)"),
+                                ("first",    r"step\s+1\s+train\s+([\d.]+)"),
+                                ("any",      r"train\s+([\d.]+)")]:
+              if not re.search(pattern, log):
+                  sys.exit(f"pattern for {name} did not match the log")
+          print("all patterns matched")
+          EOF
+
+      - name: Assert the initial loss equals ln(vocab_size)
         run: |
           python - <<'EOF'
           import re, sys
           log = open("/tmp/train.log").read()
           expected = float(re.search(r"expected initial loss\s+([\d.]+)", log).group(1))
           first = float(re.search(r"step\s+1\s+train\s+([\d.]+)", log).group(1))
-          last = float(re.findall(r"train\s+([\d.]+)", log)[-1])
-          print(f"expected {expected:.4f}, got {first:.4f}, ended {last:.4f}")
+          print(f"expected {expected:.4f}, got {first:.4f}")
           if abs(first - expected) > 0.15:
-              sys.exit(f"initial loss {first} is not ln(vocab_size) {expected}")
-          if last >= first:
-              sys.exit(f"loss did not decrease: {first} -> {last}")
+              sys.exit("initial loss is not the entropy of a uniform distribution")
+          EOF
+
+      - name: Assert the loss decreased
+        run: |
+          python - <<'EOF'
+          import re, sys
+          log = open("/tmp/train.log").read()
+          losses = [float(x) for x in re.findall(r"train\s+([\d.]+)", log)]
+          print("losses:", losses)
+          if len(losses) < 2:
+              sys.exit(f"expected at least two reported losses, saw {losses}")
+          if losses[-1] >= losses[0]:
+              sys.exit(f"loss did not decrease: {losses[0]} -> {losses[-1]}")
           EOF

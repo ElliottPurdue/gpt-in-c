@@ -2,8 +2,8 @@
 
 [![tests](https://github.com/ElliottPurdue/gpt-in-c/actions/workflows/ci.yml/badge.svg)](https://github.com/ElliottPurdue/gpt-in-c/actions/workflows/ci.yml)
 
-A transformer implemented from scratch in dependency-free C99 — forward pass
-*and* hand-derived backward pass — with PyTorch used as a numerical oracle
+A transformer implemented from scratch in dependency-free C99: forward pass
+*and* hand-derived backward pass, with PyTorch used as a numerical oracle
 rather than as a framework.
 
 The forward pass of a transformer is short enough to write from the paper. The
@@ -14,7 +14,7 @@ against `torch.autograd` element by element.
 
 **Why an oracle.** An incorrect gradient almost never announces itself. It
 usually still decreases the loss, just more slowly, so "it trains" is not
-evidence of correctness — it is the failure mode. Each operation is therefore
+evidence of correctness. It is the failure mode. Each operation is therefore
 pinned against autograd on its own, before any of it is assembled into a model.
 
 ---
@@ -23,23 +23,23 @@ pinned against autograd on its own, before any of it is assembled into a model.
 
 Early. Working so far:
 
-- `src/tensor.{h,c}` — flat row-major float32 tensors, no strides or broadcasting
-- `src/ops.{h,c}` — linear, LayerNorm, GELU, softmax, fused softmax
+- `src/tensor.{h,c}`: flat row-major float32 tensors, no strides or broadcasting
+- `src/ops.{h,c}`: linear, LayerNorm, GELU, softmax, fused softmax
   cross-entropy, and multi-head causal self-attention, each forward and backward
-- `src/model.{h,c}` — the assembled GPT: embeddings, pre-norm blocks, LM head,
+- `src/model.{h,c}`: the assembled GPT: embeddings, pre-norm blocks, LM head,
   forward and backward
-- `src/optim.{h,c}` — AdamW with decoupled weight decay, and gradient clipping
-- `src/tokenizer.{h,c}` — character-level vocabulary, encode and decode
-- `train.c` — data loading, batching, the training loop, and sampling
-- `ref/reference.py` — the PyTorch model, and a full forward/backward dump
-- `ref/units.py` — one isolated oracle case per operation
-- `tests/` — 25 tests, no framework
+- `src/optim.{h,c}`: AdamW with decoupled weight decay, and gradient clipping
+- `src/tokenizer.{h,c}`: character-level vocabulary, encode and decode
+- `train.c`: data loading, batching, the training loop, and sampling
+- `ref/reference.py`: the PyTorch model, and a full forward/backward dump
+- `ref/units.py`: one isolated oracle case per operation
+- `tests/`: 25 tests, no framework
 
 The full model agrees with PyTorch on the loss, the logits, and **every one of
 its 30,144 parameter gradients**, to 2e-5 absolute or 2e-4 relative.
 
-**It trains.** On the repository's own source and prose as a corpus — 146,501
-bytes, 105 distinct characters — a 3-layer, width-96, context-64 model of
+**It trains.** On the repository's own source and prose as a corpus (146,501
+bytes, 105 distinct characters), a 3-layer, width-96, context-64 model of
 362,016 parameters:
 
 ```
@@ -68,7 +68,7 @@ thamuan        * = izent = cononor & conde ang
 Gibberish, but structured gibberish, and the structure is the evidence. It opens
 with `#` like a preprocessor directive, places `);`, `*` and `&` plausibly,
 produces `= cens` and `= izent` assignment shapes, reproduces the source's
-eight-space indentation runs, and spells real English words from the comments —
+eight-space indentation runs, and spells real English words from the comments:
 `the`, `be`, `in`, `and`. Nothing above the character and short-word level, which
 is what 300 steps on a 362K-parameter model buys.
 
@@ -81,8 +81,8 @@ an untrained model has to start: uniform over the vocabulary. Printing the
 expected value next to it turns the first step into a check on the
 initialisation rather than an unanchored number.
 
-By step 300 training loss has pulled away from validation — 2.00 against 2.74 —
-which is overfitting beginning, and expected with 362K parameters against 132K
+By step 300 training loss has pulled away from validation, 2.00 against 2.74.
+That is overfitting beginning, and expected with 362K parameters against 132K
 training tokens. It is visible only because the validation split is contiguous;
 see below.
 
@@ -112,7 +112,7 @@ Shorter 30-step runs, used to compare build flags:
 headline figure comes from the 300-step runs rather than this table.)
 
 **The loss column is the point.** Every value is bit-identical, because the
-summation order never changed — and that claim is checkable rather than
+summation order never changed, and that claim is checkable rather than
 rhetorical, since training is deterministic. Across all 300 steps, every
 training loss, validation loss and gradient norm matches the pre-optimisation
 run exactly:
@@ -127,7 +127,7 @@ An optimisation that quietly altered the arithmetic would move that curve.
 
 **What was actually slow.** Not the arithmetic. The naive loop walks the whole
 weight matrix once per row, and the qkv projection's weights are 110 KB against
-a 32 KB L1 — so 1,024 rows cost about 113 MB of memory traffic to do 28 MFLOP of
+a 32 KB L1, so 1,024 rows cost about 113 MB of memory traffic to do 28 MFLOP of
 work. Processing rows in blocks of eight reuses each weight element eight times
 before evicting it. The backward pass splits into three loops so each can be
 blocked for the array it writes, which changes no summation order either: `dx`
@@ -137,7 +137,7 @@ exactly as when the loops were nested.
 **What did not help.** `-march=native` was *slower* (2,456), and gcc 6.3.0 on
 this 32-bit toolchain does not vectorise the inner loop usefully. It would also
 have enabled FMA, which fuses a multiply and add into one rounding step and so
-would have changed results — losing the bit-identical property for a slowdown.
+would have changed results, losing the bit-identical property for a slowdown.
 
 `-O3` also paid for itself twice: its stronger analysis caught a genuine bug in
 the oracle loader, where a short read left a variable unwritten and the error
@@ -161,10 +161,10 @@ tighter than any real bug produces.
 
 A test suite that passes proves nothing on its own, so the suite is checked by
 breaking the implementation on purpose. That check is scripted rather than
-described — `make mutate` applies each bug in turn, rebuilds, runs the suite,
+described. `make mutate` applies each bug in turn, rebuilds, runs the suite,
 restores the file, and exits non-zero if anything survives. CI runs it on every
 push, so the claim below is verified rather than asserted. **Thirty-eight mutations, thirty-eight caught,
-zero survivors** — though not all on the first attempt; see below.
+zero survivors**, though not all on the first attempt; see below.
 
 Ten of those target the assembled model rather than individual operations:
 dropping either residual connection, dropping the position embedding, post-norm
@@ -206,7 +206,7 @@ LayerNorm's saved statistics.
 The full list lives in `tools/mutate.py`, and `make mutate` runs it in about a
 minute. Every mutation must still **compile**: `-Werror` rejects an unused
 variable, so deleting a term outright often fails the build rather than the
-tests — which looks identical to being caught and is not. Terms are multiplied
+tests, which looks identical to being caught and is not. Terms are multiplied
 by zero instead, and anything that fails to compile is reported as inconclusive
 rather than counted as a pass. One mutation was scored that way on the first run
 and had to be rewritten.
@@ -222,7 +222,7 @@ The oracle is precise but shares an assumption with the code it checks: both
 implement the same architecture from the same description, so a *misreading of
 the architecture* would be reproduced on both sides and agree perfectly.
 
-So the gradients are also checked against the definition of a derivative —
+So the gradients are also checked against the definition of a derivative:
 perturb a parameter, measure how the loss actually moves, compare. That check
 knows nothing about transformers and cannot share the error.
 
@@ -232,7 +232,7 @@ shrinks, and the two squeeze the usable range of `eps` from both sides. The
 magnitude floor is derived rather than guessed: the difference moves the loss by
 about `2·eps·grad`, float32 resolves a loss near 4.3 to roughly 5e-7, and
 requiring several hundred times that gives `grad > 1e-2`. Below it the quotient
-is mostly noise — a gradient of 1e-3 shifts the loss by 2e-5, which carries
+is mostly noise. A gradient of 1e-3 shifts the loss by 2e-5, which carries
 barely two significant digits, and comparing that at 5% fails on rounding alone.
 
 Setting the floor at 1e-3 initially produced exactly that: one sampled parameter
@@ -243,7 +243,7 @@ the arithmetic above, not a wider tolerance.
 
 Both concerned buffers the forward pass is supposed to overwrite. The tests
 allocated them with `calloc` and so received clean zeroed memory every time,
-which is exactly the state a training loop never provides — those buffers are
+which is exactly the state a training loop never provides, since those buffers are
 reused every step. Forgetting to zero the masked upper triangle of the attention
 weights, or to reset the output accumulator, therefore worked on the first
 forward pass and corrupted every one after it.
@@ -271,7 +271,7 @@ a tolerance until the disagreement fits.
 ### Design notes
 
 **Gradients accumulate, they do not overwrite.** A parameter used in several
-places — tied embeddings, or a weight shared across positions — must collect
+places (tied embeddings, or a weight shared across positions) must collect
 gradient from each use, and that only works if every backward function adds.
 `test_gradients_accumulate_rather_than_overwrite` calls one twice and checks the
 result doubles. The cost is that forgetting to zero produces a slow, plausible
@@ -297,7 +297,7 @@ leak structurally impossible rather than dependent on remembering to add `-inf`.
 The entries are still written as zero, because the backward pass reads whole
 rows. Two tests cover it: one asserts the weights are zero above the diagonal
 and each row sums to one, the other edits a later token and checks that every
-earlier output is bit-identical — the behavioural consequence, which the
+earlier output is bit-identical. That is the behavioural consequence, which the
 structural check alone would not catch if values were mixed after the softmax.
 
 **A leaking causal mask is the failure that looks most like success.** The model
@@ -312,9 +312,9 @@ orders of magnitude above the tolerance these tests run at.
 is a 32-bit toolchain, where gcc defaults to the x87 unit and `FLT_EVAL_METHOD`
 is 2: every float expression is evaluated in 80 bits and rounded to 32 only when
 stored. That makes the library quietly more accurate than the float32 it claims
-to be, hides error a real single-precision FPU would show, and — the symptom
-that exposed it — breaks exact comparisons, since a value in memory and the same
-value in a register are not bit-identical. A clipping test failed on
+to be, hides error a real single-precision FPU would show, and breaks exact
+comparisons, since a value in memory and the same value in a register are not
+bit-identical. That last effect is what exposed it. A clipping test failed on
 `grads[0] == 0.3f` while the bytes were provably unchanged.
 
 The targets this code is written for, Cortex-M and Xtensa, have genuine 32-bit
@@ -335,7 +335,7 @@ badly the model overfits, and the metric that exists to detect memorisation is
 the one memorisation defeats. The last 10% is held out as a single block.
 
 **Training is deterministic.** Two runs of the same command produce identical
-losses at every step, bit for bit — the initialisation is a seeded xorshift and
+losses at every step, bit for bit. The initialisation is a seeded xorshift and
 the batch sampler is seeded too, with nothing reading the clock or the host's
 `rand()`. That matters for what comes next: a regression introduced while
 optimising the matmul shows up as a changed loss curve rather than disappearing
@@ -343,7 +343,7 @@ into run-to-run noise.
 
 **The corpus is the repository itself.** Its own source, tests and prose,
 concatenated by a Makefile target. No download, fully reproducible, and C gives a
-character model plenty of structure to learn — matched braces, indentation,
+character model plenty of structure to learn: matched braces, indentation,
 comment delimiters, identifier conventions.
 
 **A checkpoint carries its vocabulary.** Token ids mean nothing without the
@@ -356,7 +356,7 @@ construction, so writing them is a single `fwrite` and no serialiser needs to
 know the model's structure.
 
 **The CI log is read with `errors="replace"`.** It embeds the generated sample,
-which is raw bytes the model emits in arbitrary order — including fragments of
+which is raw bytes the model emits in arbitrary order, including fragments of
 the multi-byte UTF-8 sequences in the corpus. That is not valid UTF-8, so a
 strict read raises `UnicodeDecodeError` on Linux while succeeding on Windows,
 whose default codec accepts any byte. Four assertions failed on that decode
@@ -386,7 +386,7 @@ make oracle     # regenerate data/*.bin from ref/*.py
 make test       # 10 tests
 ```
 
-The oracle dumps are generated rather than committed — they are derived from
+The oracle dumps are generated rather than committed, since they are derived from
 `ref/*.py`, and a binary blob in the history is something nobody can review.
 
 ## License

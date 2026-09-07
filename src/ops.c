@@ -3,6 +3,34 @@
 #include <math.h>
 #include <string.h>
 
+/* Threading, and the one rule it has to obey.
+ *
+ * Floating-point addition is not associative, so a sum computed in a different
+ * order is a different number. This library's central claim is that the loss
+ * curve is bit-identical between implementations, which is how the blocked
+ * matmul was shown not to have altered the mathematics. Threading is allowed to
+ * split work only across loops that partition the OUTPUT of an accumulation,
+ * never across the index being accumulated. That rules out the obvious
+ * `reduction(+:...)` over the contraction index: it would combine per-thread
+ * partial sums in whatever order the threads finish, and the claim would be
+ * gone while every tolerance-based test stayed green.
+ *
+ * Where the pragmas below sit, each output element is still summed by one
+ * thread, over the same index, in the same direction, as it was serially. The
+ * result therefore does not depend on the thread count, and OMP_NUM_THREADS=1
+ * and =16 produce the same bytes. tools/verify_determinism.py checks that
+ * rather than trusting it.
+ *
+ * The macro is guarded on _OPENMP rather than written as a bare pragma so a
+ * compiler without -fopenmp sees nothing at all. A bare `#pragma omp` would
+ * otherwise trip -Wunknown-pragmas, which -Wall enables and -Werror makes
+ * fatal, and the 32-bit MinGW 6.3 build has no OpenMP at all. */
+#ifdef _OPENMP
+#define GPTC_OMP_FOR _Pragma("omp parallel for schedule(static)")
+#else
+#define GPTC_OMP_FOR
+#endif
+
 /* ------------------------------------------------------------------------
  * Linear
  * ------------------------------------------------------------------------ */
@@ -109,6 +137,14 @@ void linear_forward(float *out, const float *x, const float *weight,
                     const float *bias, int rows, int in_features,
                     int out_features)
 {
+    /* out[r][o] accumulates over i ascending, and the whole i loop lives inside
+     * one r0 iteration, so no output element's sum is ever split across
+     * threads. Row blocks own disjoint rows of out, and the write at the bottom
+     * is a store rather than a +=, so nothing is accumulated across iterations
+     * either. acc[] is declared inside the o body and is therefore private per
+     * thread; hoisting it out of the loop would make it one shared array and is
+     * the single edit that breaks this. */
+    GPTC_OMP_FOR
     for (int r0 = 0; r0 < rows; r0 += ROW_BLOCK) {
         int block = rows - r0 < ROW_BLOCK ? rows - r0 : ROW_BLOCK;
 
@@ -149,8 +185,16 @@ void linear_backward(float *dx, float *dweight, float *dbias,
                      int rows, int in_features, int out_features)
 {
     /* dx[r][i] = sum_o dy[r][o] * W[o][i]. Blocked over rows for the same
-     * reason as the forward pass: one weight row serves ROW_BLOCK outputs. */
+     * reason as the forward pass: one weight row serves ROW_BLOCK outputs.
+     *
+     * Note which index is the accumulation one here: dx sums over o, not over
+     * i, the reverse of the forward pass. Threading r0 keeps the entire o sweep
+     * inside one iteration for every (r, i), so each element still sums o
+     * ascending. Threading the o loop instead would be tempting, since it has
+     * more iterations to hand out, and would be wrong twice over: a write race
+     * on dxr[i], and a reordered sum. An atomic would fix only the first. */
     if (dx) {
+        GPTC_OMP_FOR
         for (int r0 = 0; r0 < rows; r0 += ROW_BLOCK) {
             int block = rows - r0 < ROW_BLOCK ? rows - r0 : ROW_BLOCK;
 
@@ -170,8 +214,14 @@ void linear_backward(float *dx, float *dweight, float *dbias,
 
     /* dW[o][i] = sum_r dy[r][o] * x[r][i]. Blocked over outputs: OUT_BLOCK rows
      * of the gradient stay resident while the inputs stream past once, rather
-     * than the inputs streaming once per output. */
+     * than the inputs streaming once per output.
+     *
+     * dweight[o][i] accumulates over r ascending, so this one is threaded on
+     * o0, the opposite axis from the dx loop above. That is exactly why the two
+     * sections cannot be fused and threaded on a single index. Each o0 chunk
+     * owns OUT_BLOCK disjoint rows of dweight with the full r sweep inside. */
     if (dweight) {
+        GPTC_OMP_FOR
         for (int o0 = 0; o0 < out_features; o0 += OUT_BLOCK) {
             int block = out_features - o0 < OUT_BLOCK ? out_features - o0 : OUT_BLOCK;
 
@@ -190,7 +240,18 @@ void linear_backward(float *dx, float *dweight, float *dbias,
         }
     }
 
-    /* db[o] = sum_r dy[r][o]. */
+    /* db[o] = sum_r dy[r][o].
+     *
+     * Serial, and not by oversight. The outer loop here is r, which is the
+     * accumulation index, so threading it is a write race on dbias[o] and every
+     * repair is worse than the fault: atomic and critical fix the race and
+     * leave the arrival order up to the scheduler, and a reduction combines
+     * per-thread partials in an unspecified order. All three would break
+     * bit-identity. Interchanging the loops to `for o { for r { ... } }` would
+     * be order-preserving and threadable, but this section is O(rows *
+     * out_features) against the other two at O(rows * in_features *
+     * out_features), so it is well under 1% of the work and there is nothing to
+     * buy. */
     if (dbias) {
         for (int r = 0; r < rows; ++r) {
             const float *doutr = dout + (size_t)r * out_features;
@@ -302,6 +363,12 @@ void layernorm_backward(float *dx, float *dweight, float *dbias,
 
 void gelu_forward(float *out, const float *x, int n)
 {
+    /* Elementwise, so there is no summation order to preserve at all: distinct
+     * i write distinct elements and nothing read is written by any iteration.
+     * The safety argument here is about shape rather than about associativity,
+     * which makes this the cheapest parallelism in the file. It is also worth
+     * having: erff is called once per element, several million times a step. */
+    GPTC_OMP_FOR
     for (int i = 0; i < n; ++i) {
         out[i] = 0.5f * x[i] * (1.0f + erff(x[i] * SQRT_1_2));
     }
@@ -311,7 +378,12 @@ void gelu_backward(float *dx, const float *dout, const float *x, int n)
 {
     /* d/dx [0.5x(1 + erf(x/sqrt2))] = 0.5(1 + erf(x/sqrt2)) + x * phi(x)
      * where phi is the standard normal density. The second term is the one
-     * that distinguishes GELU's gradient from a gated linear unit's. */
+     * that distinguishes GELU's gradient from a gated linear unit's.
+     *
+     * The += reads and writes dx[i] only, and exactly one iteration touches
+     * each i, so it accumulates the caller's existing gradient and nothing from
+     * another iteration. No cross-iteration dependency, so again no order. */
+    GPTC_OMP_FOR
     for (int i = 0; i < n; ++i) {
         float v = x[i];
         float cdf = 0.5f * (1.0f + erff(v * SQRT_1_2));

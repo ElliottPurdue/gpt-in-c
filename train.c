@@ -24,9 +24,28 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+/* Wall time under OpenMP, clock() otherwise.
+ *
+ * This is not a stylistic choice. clock() returns per-process CPU time on
+ * glibc, which sums across threads, so a 16-thread run that finished four times
+ * sooner would report itself four times slower. On MinGW clock() returns wall
+ * time and the same code would report correctly, so the bug would appear on
+ * Linux only and look like the threading having made things worse.
+ *
+ * clock() is kept for the serial build rather than replacing both with a wall
+ * clock, because every timing figure in the README was measured with it and
+ * they agree with wall time when only one thread is running. */
 static double seconds_now(void)
 {
+#ifdef _OPENMP
+    return omp_get_wtime();
+#else
     return (double)clock() / (double)CLOCKS_PER_SEC;
+#endif
 }
 
 /* Checkpoint format, little-endian:
@@ -296,6 +315,12 @@ int main(int argc, char **argv)
     printf("  corpus      %s, %zu bytes, %d distinct characters\n",
            path, file_length, tok.vocab_size);
     printf("  fingerprint %08lx\n", corpus_hash);
+#ifdef _OPENMP
+    /* Printed because a threaded binary that quietly fell back to one
+     * thread would pass a determinism sweep for the wrong reason: every
+     * thread count would agree because every run was serial. */
+    printf("  threads     %d\n", omp_get_max_threads());
+#endif
     printf("  split       %zu train / %zu validation tokens\n",
            train_count, val_count);
     printf("  model       %d layers, %d heads, width %d, context %d\n",

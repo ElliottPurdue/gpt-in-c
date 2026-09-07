@@ -78,6 +78,64 @@ jobs:
       - name: Break it on purpose
         run: python tools/mutate.py
 
+  openmp:
+    name: threading changes nothing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Report the cores available
+        run: nproc
+
+      - name: Build the corpus
+        run: make data/input.txt PYTHON=python
+
+      # Both binaries, from one tree. The serial one is the reference: it is the
+      # build every figure in the README was measured with, and the one the
+      # oracle tests run against.
+      - name: Build the serial and threaded trainers
+        run: |
+          make build/train PYTHON=python
+          make build/train_omp PYTHON=python
+
+      - name: Confirm the threaded build actually has parallel regions
+        # Cheap, and it closes the most embarrassing failure mode: if -fopenmp
+        # were dropped or the pragmas were guarded out, every thread count would
+        # agree because every run was serial, and the job below would pass while
+        # testing nothing. Five regions, named, or this fails.
+        run: |
+          nm build/train_omp | grep -o '[a-z_]*\._omp_fn\.[0-9]*' | sort -u | tee /tmp/regions.txt
+          test "$(wc -l < /tmp/regions.txt)" -eq 5
+          grep -q 'linear_forward\._omp_fn\.0' /tmp/regions.txt
+          grep -q 'linear_backward\._omp_fn\.0' /tmp/regions.txt
+          grep -q 'linear_backward\._omp_fn\.1' /tmp/regions.txt
+          grep -q 'gelu_forward\._omp_fn\.0' /tmp/regions.txt
+          grep -q 'gelu_backward\._omp_fn\.0' /tmp/regions.txt
+
+      - name: No reduction, atomic or critical anywhere
+        # The one edit that would silently break the claim while passing every
+        # test in the suite. Checked against the PREPROCESSED source, because
+        # the comments in ops.c explaining why these constructs are absent
+        # contain the words and would match a plain grep.
+        run: |
+          gcc -std=c99 -fopenmp -E src/ops.c > /tmp/ops.i
+          if grep -nE 'omp.*(reduction|atomic|critical|simd)' /tmp/ops.i; then
+            echo "a reordering construct reached the matmul"
+            exit 1
+          fi
+          echo "none present"
+
+      # The actual claim. Exact byte comparison, several thread counts, against
+      # the serial build. Tolerance-based tests cannot do this job: they run at
+      # 1e-5 absolute and a reordered sum moves results by about 1e-7, so the
+      # suite stays green while the property it protects is gone.
+      - name: Same bytes at every thread count
+        run: make verify-determinism PYTHON=python
+
   train:
     name: it trains
     runs-on: ubuntu-latest

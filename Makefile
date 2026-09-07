@@ -21,7 +21,7 @@ TESTS = tests/main.c tests/oracle.c tests/test_ops.c tests/test_model.c tests/te
 
 PYTHON ?= python
 
-.PHONY: all test oracle train bench-matmul mutate clean
+.PHONY: all test oracle train bench-matmul omp verify-determinism mutate clean
 
 all: test
 
@@ -91,6 +91,39 @@ bench-matmul: data/input.txt | build
 	@echo ""
 	@echo "=== blocked ==="
 	./build/train_blocked data/input.txt $(STEPS)
+
+# OpenMP builds, as separate targets rather than a variable on the default ones.
+#
+# A variable would be the obvious design and is the wrong one here: tools/
+# mutate.py shells out to `$(MAKE) test` without passing an env, so an exported
+# OMP=1 in the caller's environment would win over a makefile default and the
+# mutation suite would silently measure a build nobody asked for. Separate
+# targets cannot be turned on by accident.
+#
+# -ffp-contract=off is insurance, not a fix. -std=c99 already disables
+# contraction, so a multiply and an add are not fused into one rounding step
+# today, and the assembly confirms it. But that is a side effect of the standards
+# mode, and a later switch to -std=gnu99 would silently enable FMA and change
+# every result. Saying it outright costs nothing and removes the trap.
+OMPFLAGS = -fopenmp -ffp-contract=off
+
+build/train_omp: $(SRC) train.c | build
+	$(CC) $(CFLAGS) $(OMPFLAGS) $(SRC) train.c -o $@ $(LDFLAGS)
+
+build/run_tests_omp: $(SRC) $(TESTS) | build
+	$(CC) $(CFLAGS) $(OMPFLAGS) $(SRC) $(TESTS) -o $@ $(LDFLAGS)
+
+omp: build/run_tests_omp
+	./build/run_tests_omp
+
+# The claim threading has to earn: same bytes at every thread count.
+#
+# `make test` cannot establish it. Its tolerances are 1e-5 absolute and 1e-4
+# relative, while a reordered sum over a few hundred elements moves a result by
+# about 1e-7, so a build with the accumulation order destroyed passes the entire
+# suite. Only an exact comparison is evidence, which is what the harness does.
+verify-determinism: build/train build/train_omp data/input.txt
+	$(PYTHON) tools/verify_determinism.py
 
 # Breaks the library on purpose, one bug at a time, and checks the suite
 # notices. A passing suite is evidence about the tests only if they can fail.

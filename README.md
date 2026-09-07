@@ -80,7 +80,7 @@ With that fixed, the run reproduces across the two exactly:
   fingerprint        ee7d483c                      ee7d483c
   step     1         4.5547  4.2693  4.449         4.5547  4.2693  4.449
   step    20         3.3656  3.2088  1.079         3.3656  3.2088  1.079
-  throughput         2,576 tokens/s                CI_THROUGHPUT
+  throughput         2,576 tokens/s                4,421 tokens/s
 ```
 
 Same digits on two architectures under compilers seven major versions apart,
@@ -135,13 +135,14 @@ figure here changed the run it described.
 
 ### The 32-bit toolchain is costing somewhere between 1.4x and 1.8x
 
-CI reports **3,547 and 4,538 tokens/s** on two consecutive runs of identical
-code, against **2,576** on the development machine. The runner is x86-64 with
-GCC 13; the local build is 32-bit MinGW 6.3, which has half the registers, an
-older optimiser, and no pthread, which is also why OpenMP is unavailable here.
-The loss curve is identical on both, as above; only the speed moves.
+CI reports **4,421 tokens/s** against **2,576** on the development machine, a
+gap of 1.72x. Two earlier runs of identical code, on an earlier corpus, reported
+3,547 and 4,538. The runner is x86-64 with GCC 13; the local build is 32-bit
+MinGW 6.3, which has half the registers, an older optimiser, and no pthread,
+which is also why the threaded build below cannot run there. The loss curve is
+identical on both, as above; only the speed moves.
 
-Two runs disagreeing by 28% is the honest answer here, and it is why this
+Three runs spanning 3,547 to 4,538 is the honest answer here, and it is why this
 heading gives a range. GitHub runners are shared hardware with no guarantee
 about what else is on the machine, so a single measurement from one is a sample
 of the runner as much as of the code. An earlier draft of this section read

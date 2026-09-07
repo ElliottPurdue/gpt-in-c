@@ -132,14 +132,23 @@ README from the corpus removed both that confound and a worse one: the file
 reporting these numbers was part of the data producing them, so correcting a
 figure here changed the run it described.
 
-### The 32-bit toolchain is costing about 1.4x
+### The 32-bit toolchain is costing somewhere between 1.4x and 1.8x
 
-CI reports **3,547 tokens/s** on a GitHub runner against **2,592** on the
-development machine, on identical code and, as above, an identical loss curve. The runner is x86-64 with GCC 13; the
-local build is 32-bit MinGW 6.3, which has half the registers, an older
-optimiser, and no pthread -- which is also why OpenMP is unavailable here. The
-matmul work below is measured on the slower of the two, so the figures are
-conservative rather than flattering.
+CI reports **3,547 and 4,538 tokens/s** on two consecutive runs of identical
+code, against **2,592** on the development machine. The runner is x86-64 with
+GCC 13; the local build is 32-bit MinGW 6.3, which has half the registers, an
+older optimiser, and no pthread, which is also why OpenMP is unavailable here.
+The loss curve is identical on both, as above; only the speed moves.
+
+Two runs disagreeing by 28% is the honest answer here, and it is why this
+heading gives a range. GitHub runners are shared hardware with no guarantee
+about what else is on the machine, so a single measurement from one is a sample
+of the runner as much as of the code. An earlier draft of this section read
+**1.8x** from one such sample and stated it as a fact.
+
+That variance is also the reason every matmul figure below is measured locally,
+on a machine whose load is known, and on the slower of the two toolchains. Those
+numbers are conservative rather than flattering, and they are repeatable.
 
 ### Making it faster, and proving it still computes the same thing
 

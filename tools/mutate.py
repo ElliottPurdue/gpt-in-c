@@ -59,9 +59,13 @@ MUTATIONS = [
      "out[i] = 0.5f * x[i] * (1.0f + tanhf(SQRT_2_PI * (x[i] + 0.044715f * x[i] * x[i] * x[i])));"),
 
     # ---- Softmax --------------------------------------------------------
+    # Zeroed rather than deleted. Dropping `- dot` removes the only read of
+    # `dot`, and gcc 16 rejects that under -Werror=unused-but-set-variable where
+    # gcc 6.3 let it through, so the mutation stopped testing anything and
+    # started reporting "did not compile" on the newer toolchain only.
     ("src/ops.c", "softmax backward: keep only the diagonal term",
      "dxr[c] += outr[c] * (doutr[c] - dot);",
-     "dxr[c] += outr[c] * doutr[c];"),
+     "dxr[c] += outr[c] * (doutr[c] - 0.0f * dot);"),
     ("src/ops.c", "softmax forward: remove the max subtraction",
      "float e = expf(xr[c] - maximum);",
      "float e = expf(xr[c] - 0.0f * maximum);"),
@@ -99,9 +103,10 @@ MUTATIONS = [
     ("src/ops.c", "attention: drop the 1/sqrt(head_dim) scale, backward",
      "float dscore = att_row[j] * (datt_row[j] - dot) * scale;",
      "float dscore = att_row[j] * (datt_row[j] - dot) * (0.0f * scale + 1.0f);"),
+    # Zeroed for the same reason as the softmax one above.
     ("src/ops.c", "attention backward: drop the softmax dot term",
      "float dscore = att_row[j] * (datt_row[j] - dot) * scale;",
-     "float dscore = att_row[j] * datt_row[j] * scale;"),
+     "float dscore = att_row[j] * (datt_row[j] - 0.0f * dot) * scale;"),
     ("src/ops.c", "attention backward: swap the dq and dk accumulation",
      "dq[d] += dscore * k[d];\n                        dk[d] += dscore * q[d];",
      "dq[d] += dscore * q[d];\n                        dk[d] += dscore * k[d];"),

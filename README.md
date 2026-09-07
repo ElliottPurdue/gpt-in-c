@@ -73,21 +73,27 @@ carried one extra byte per line and one extra vocabulary entry, and every figure
 below was reproducible only on the machine that produced it. The rule strips
 carriage returns now.
 
-With that fixed, the run reproduces across the two exactly:
+With that fixed, the run reproduces across every toolchain it has been built on:
 
 ```
-                     32-bit MinGW 6.3, Windows     GCC 13 x86-64, Linux
-  fingerprint        ee7d483c                      ee7d483c
-  step     1         4.5547  4.2693  4.449         4.5547  4.2693  4.449
-  step    20         3.3656  3.2088  1.079         3.3656  3.2088  1.079
-  throughput         2,576 tokens/s                4,421 tokens/s
+                    MinGW 6.3 32-bit    MinGW 16.2 64-bit    GCC 13 x86-64
+                    Windows             Windows              Linux
+
+  fingerprint       ee7d483c            ee7d483c             ee7d483c
+  FLT_EVAL_METHOD   2, pinned to 0      0                    0
+  step   1          4.5547  4.2693      4.5547  4.2693       4.5547  4.2693
+  step 300          2.2246  2.3303      2.2246  2.3303       (20-step run)
+  throughput        2,543 tok/s         5,929 tok/s          4,421 tok/s
 ```
 
-Same digits on two architectures under compilers seven major versions apart,
-with only the speed differing. That is what `-msse2 -mfpmath=sse` in the Makefile
-buys: pinning the host build to a true 32-bit FPU instead of letting x87
-evaluate at 80 bits is the difference between a curve that reproduces elsewhere
-and one that does not.
+Same digits on two architectures and two operating systems, under compilers ten
+major versions apart, with only the speed differing. That is what `-msse2
+-mfpmath=sse` in the Makefile buys. Only the 32-bit build needs it: it reports
+`FLT_EVAL_METHOD` 2, meaning x87 evaluates every float expression at 80 bits and
+rounds on store, and pinning it to SSE2 is what makes that column match the
+other two. On x86-64 the flag is a no-op, because SSE2 is the baseline there and
+`FLT_EVAL_METHOD` is already 0. The comment in the Makefile predicted this
+before there was a 64-bit build to check it against.
 
 Sampling at temperature 0.8 after those 300 steps:
 
@@ -133,24 +139,23 @@ README from the corpus removed both that confound and a worse one: the file
 reporting these numbers was part of the data producing them, so correcting a
 figure here changed the run it described.
 
-### The 32-bit toolchain is costing somewhere between 1.4x and 1.8x
+### The 32-bit toolchain is costing 2.3x
 
-CI reports **4,421 tokens/s** against **2,576** on the development machine, a
-gap of 1.72x. Two earlier runs of identical code, on an earlier corpus, reported
-3,547 and 4,538. The runner is x86-64 with GCC 13; the local build is 32-bit
-MinGW 6.3, which has half the registers, an older optimiser, and no pthread,
-which is also why the threaded build below cannot run there. The loss curve is
-identical on both, as above; only the speed moves.
+The same 300 steps, same corpus, same machine: **2,543 tokens/s** on 32-bit
+MinGW GCC 6.3 against **5,929** on 64-bit MinGW GCC 16.2. The 32-bit build has
+half the registers, a compiler ten major versions older, and no pthread. The
+loss curve is identical on both.
 
-Three runs spanning 3,547 to 4,538 is the honest answer here, and it is why this
-heading gives a range. GitHub runners are shared hardware with no guarantee
-about what else is on the machine, so a single measurement from one is a sample
-of the runner as much as of the code. An earlier draft of this section read
-**1.8x** from one such sample and stated it as a fact.
+This number replaces a range. Earlier revisions compared the local 32-bit build
+against a GitHub runner and read the gap as 1.8x, then as somewhere between 1.4x
+and 1.8x once three runs came back at 3,547, 4,421 and 4,538 tokens/s on
+identical code. That spread is the runner, not the code: CI runs on shared
+hardware with no guarantee about what else is on it, so one measurement from one
+samples the machine as much as the program. Two builds on one machine settle in
+a single run what three CI runs could not.
 
-That variance is also the reason every matmul figure below is measured locally,
-on a machine whose load is known, and on the slower of the two toolchains. Those
-numbers are conservative rather than flattering, and they are repeatable.
+Which is also why every matmul figure below is measured locally rather than in
+CI, and why they are repeatable.
 
 ### Making it faster, and proving it still computes the same thing
 
@@ -287,11 +292,49 @@ Compiled without `-fopenmp`, `src/ops.c` produces assembly byte-identical to the
 version before any of this, so the serial build is unchanged code rather than
 code that merely behaves the same.
 
-**Not yet measured.** Avast quarantines binaries produced by the 64-bit
-toolchain on the development machine, `ld.exe` among them, so the threaded build
-compiles and links there but cannot run. Every claim above is from codegen and
-from CI. There is no local speedup figure yet, and this section will not carry
-one until there is a measurement behind it.
+**Measured.** On 16 physical cores, 300 steps, 64-bit GCC 16.2:
+
+| threads | time | tokens/s | vs serial |
+|---|---|---|---|
+| serial, no `-fopenmp` | 56.7 s | 5,929 | 1.00x |
+| 1 | 69.0 s | 4,987 | 0.84x |
+| 2 | 51.3 s | 6,572 | 1.11x |
+| 4 | 30.7 s | 10,941 | 1.85x |
+| 8 | 18.9 s | 17,783 | 3.00x |
+| 16 | 15.2 s | 21,979 | 3.71x |
+| 32 | 13.9 s | 24,013 | **4.05x** |
+
+Every row above produced the same loss curve, gradient norms and sampled text as
+the serial build, byte for byte, across all 300 steps.
+
+**The single-threaded row is the honest part of this table.** Building with
+`-fopenmp` and then running on one thread is 16% *slower* than not building with
+it at all: 69.0 s against 56.7. The pragmas cost something even when no
+parallelism happens, partly fork and join around every region and partly the
+optimiser having less freedom inside a loop it must hand to a runtime. Threading
+does not become a win until two threads, and the honest baseline for the
+speedup is the serial build, not the one-thread run, which would have flattered
+it to 4.96x.
+
+**4.05x on 16 cores is not a disappointment, it is arithmetic.** Inverting
+Amdahl's law on the 32-thread figure puts the parallel fraction at 0.78, so
+about 22% of a step is still serial: attention, layernorm, softmax, the
+optimiser, and the `dbias` loop that had to stay ordered. Threading the matmul
+and GELU cannot buy more than that ceiling no matter how many cores are added,
+which is exactly what the flattening between 16 and 32 threads shows. The next
+real gain is in what is still serial, not in more threads.
+
+Scaling is also sublinear well before the ceiling: 3.00x at 8 threads and 3.71x
+at 16. `schedule(static)` splits `out_features / OUT_BLOCK` chunks across
+threads, and for the projections that is 6 chunks against 16 threads, so most of
+them idle. `OUT_BLOCK` appears nowhere in any summation order, which makes it a
+free knob under the determinism claim, and lowering it is the obvious next
+experiment.
+
+For scale against the figures elsewhere in this file, which come from the 32-bit
+MinGW 6.3 build: 2,543 tokens/s there, 5,929 for the same code on 64-bit GCC
+16.2, and 24,013 threaded on 32. That is **9.4x** end to end, and the loss curve
+never moved.
 ## Verification
 
 CI runs the suite, the mutation pass, and a short training run on every push,
@@ -355,6 +398,16 @@ tests, which looks identical to being caught and is not. Terms are multiplied
 by zero instead, and anything that fails to compile is reported as inconclusive
 rather than counted as a pass. One mutation was scored that way on the first run
 and had to be rewritten.
+
+Two more were caught by the same rule years later, when the suite was first run
+under gcc 16 instead of gcc 6.3. Both deleted the only *read* of a variable
+rather than the only write, and the newer compiler rejects that under
+`-Werror=unused-but-set-variable` where the older one did not. The mutations had
+stopped testing anything and started reporting "did not compile", on one
+toolchain only. Multiplying the term by zero instead fixed both, and the whole
+suite is 38 of 38 on gcc 6.3 32-bit and gcc 16.2 64-bit alike. Reporting an
+uncompilable mutation as inconclusive rather than caught is what made this
+visible at all: as a pass it would have been indistinguishable from working.
 
 A pattern that matches the source in more than one place is reported the same
 way. This is not hypothetical: `src/ops.c` now carries the pre-optimisation

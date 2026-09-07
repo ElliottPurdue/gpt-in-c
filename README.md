@@ -38,57 +38,81 @@ Early. Working so far:
 The full model agrees with PyTorch on the loss, the logits, and **every one of
 its 30,144 parameter gradients**, to 2e-5 absolute or 2e-4 relative.
 
-**It trains.** On the repository's own source and prose as a corpus (146,501
-bytes, 105 distinct characters), a 3-layer, width-96, context-64 model of
-362,016 parameters:
+**It trains.** On the repository's own source as a corpus (147,047 bytes, 96
+distinct characters), a 3-layer, width-96, context-64 model of 360,288
+parameters:
 
 ```
-  expected initial loss  4.6540  (ln 105)
+  corpus      data/input.txt, 147047 bytes, 96 distinct characters
+  fingerprint cf70ccf2
+  split       132342 train / 14705 validation tokens
 
-  step     1   train 4.6442   val 4.3820   |grad| 4.510
-  step    50   train 2.8486   val 3.0872   |grad| 1.382
-  step   100   train 2.5643   val 2.9018   |grad| 0.969
-  step   200   train 2.5997   val 2.8195   |grad| 1.086
-  step   300   train 2.0048   val 2.7374   |grad| 1.505
+  expected initial loss  4.5643  (ln 96)
 
-  300 steps in 187.0 s, 1780 tokens/s
+  step     1   train 4.6485   val 4.3087   |grad| 4.594
+  step    50   train 2.9242   val 2.7815   |grad| 1.272
+  step   100   train 2.5672   val 2.6521   |grad| 1.996
+  step   150   train 2.2816   val 2.5133   |grad| 1.160
+  step   200   train 2.4965   val 2.4895   |grad| 1.329
+  step   250   train 2.3650   val 2.4090   |grad| 1.204
+  step   300   train 1.9841   val 2.3109   |grad| 1.311
+
+  300 steps in 130.7 s, 2577 tokens/s
 ```
 
-(That run predates the matmul work below; the same 300 steps now take 132.8 s at
-2,534 tokens/s, with identical losses.)
+The corpus is built from the repository's source files by `make data/input.txt`,
+so it moves when the code does, and the fingerprint is printed so two runs can
+be shown to have seen the same bytes rather than assumed to have. Size and
+vocabulary alone will not do it: an edit that adds one character and removes
+another leaves both unchanged.
 
 Sampling at temperature 0.8 after those 300 steps:
 
 ```
-#dibes Nl Nize_o et);        ept thand ig tear = cens d ourwer s te sur/
-ssemels ctelonthe the be in nf ye hera t ans t alo t capr ifemarg onamemrcrall
-thamuan        * = izent = cononor & conde ang
+"_p.loche coutpe, warss ale catse                           rerendor twor ims,
+delt ithemevos titeched cliny ameon t aly sid taten ind ameddimig lontered ats
+ay f = ("lecocesize_t_contendeng ais;
 ```
 
-Gibberish, but structured gibberish, and the structure is the evidence. It opens
-with `#` like a preprocessor directive, places `);`, `*` and `&` plausibly,
-produces `= cens` and `= izent` assignment shapes, reproduces the source's
-eight-space indentation runs, and spells real English words from the comments:
-`the`, `be`, `in`, `and`. Nothing above the character and short-word level, which
-is what 300 steps on a 362K-parameter model buys.
+Gibberish, but structured gibberish, and the structure is the evidence. It
+spells `size_t` correctly in the middle of an invented identifier, which is the
+longest real token in the sample and not a short one to reach by accident. It
+opens on a quote, closes a statement with `;`, produces the `= (` shape that
+begins an assignment from a call or a cast, joins words with underscores the way
+the identifiers it trained on do, keeps a comma-separated rhythm, and reproduces
+the long indentation runs. Nothing above the character and short-token level,
+which is what 300 steps on a 360K-parameter model buys.
 
-For scale, 2.74 nats is about 3.95 bits per character; a well-trained character
-model on English runs nearer 1 to 1.5. The loss was still falling when the run
-stopped.
+For scale, 2.31 nats is about 3.33 bits per character; a well-trained character
+model on English runs nearer 1 to 1.5. Both curves were still falling when the
+run stopped.
 
-The first loss lands on `ln(vocab_size)` to three decimal places, which is where
-an untrained model has to start: uniform over the vocabulary. Printing the
-expected value next to it turns the first step into a check on the
-initialisation rather than an unanchored number.
+The first loss lands within 0.084 of `ln(vocab_size)`, and above it: 4.6485
+against 4.5643. Above is the only direction available, since a randomly
+initialised model is not exactly uniform and any departure from uniform costs
+cross-entropy. Printing the expected value next to it turns the first step into
+a check on the initialisation rather than an unanchored number, and the check is
+worth having: a starting loss near zero means the targets have leaked into the
+inputs, and one several times larger means the initialisation scale is wrong.
 
-By step 300 training loss has pulled away from validation, 2.00 against 2.74.
-That is overfitting beginning, and expected with 362K parameters against 132K
-training tokens. It is visible only because the validation split is contiguous;
-see below.
+By step 300 training loss has pulled ahead of validation, 1.98 against 2.31. The
+gap is real but small, which is the expected shape for 360K parameters against
+132K training tokens: enough capacity to begin memorising, not enough steps to
+have done much of it yet.
+
+An earlier version of this corpus included README.md, and reported a far wider
+gap, 2.00 against 2.74. Most of that was not overfitting. The validation split
+is the last 10% of the corpus, taken contiguously, and the README was
+concatenated last, so validation was roughly 15 KB of English prose while
+training was almost entirely C. The model was being asked to generalise across a
+change of language, and the penalty was being read as memorisation. Dropping the
+README from the corpus removed both that confound and a worse one: the file
+reporting these numbers was part of the data producing them, so correcting a
+figure here changed the run it described.
 
 ### The 32-bit toolchain is costing about 1.8x
 
-CI reports **4,568 tokens/s** on a GitHub runner against **2,534** on the
+CI reports **CI_TOKENS tokens/s** on a GitHub runner against **2,577** on the
 development machine, on identical code. The runner is x86-64 with GCC 13; the
 local build is 32-bit MinGW 6.3, which has half the registers, an older
 optimiser, and no pthread -- which is also why OpenMP is unavailable here. The
@@ -97,33 +121,53 @@ conservative rather than flattering.
 
 ### Making it faster, and proving it still computes the same thing
 
-The naive matmul was the entire cost. Restructuring it is worth **1.42x** on the
-full 300-step run: 1,784 to 2,534 tokens/s, 187.0 s down to 132.8 s.
+The matmul was the entire cost. Restructuring it is worth **1.12x** on the full
+300-step run: 2,296 to 2,577 tokens/s, 148.4 s down to 130.7 s.
+
+The version it replaced is still in the tree, behind `-DGPTC_NAIVE_MATMUL`,
+copied back verbatim from the commit before the change. `make bench-matmul`
+builds both and runs them on the same corpus. Keeping it costs forty lines and
+buys the only thing that makes the claims below checkable rather than asserted,
+since both of them are claims about a comparison and a comparison needs the
+other side present. A paraphrase would not have done: what is being measured is
+exactly how those loops are written.
 
 Shorter 30-step runs, used to compare build flags:
 
 | build | tokens/s | training loss at step 30 |
 |---|---|---|
-| naive triple loop, `-O2` | 1,653 | 2.9605 |
-| blocked, `-O2` | 1,965 | 2.9605 |
-| blocked, `-O3` | **2,572** | 2.9605 |
+| naive triple loop, `-O2` | 1,761 | 3.0183 |
+| blocked, `-O2` | 1,828 | 3.0183 |
+| naive triple loop, `-O3` | 2,247 | 3.0183 |
+| blocked, `-O3` | **2,574** | 3.0183 |
 
 (Short runs measure high or low by 5-10% depending on warm-up, which is why the
 headline figure comes from the 300-step runs rather than this table.)
 
+**An earlier revision of this section claimed 1.42x**, comparing 1,784 tokens/s
+against 2,534. That was measured across two commits rather than one: the tree
+had moved on between the two runs, so the figure credited the blocking with
+changes that were not the blocking. Rebuilding both halves from the same tree,
+on the same corpus, gives 1.12x. The correction is in the direction that matters,
+and it is the reason the naive path is now a build flag instead of a commit
+somebody has to go and find.
+
 **The loss column is the point.** Every value is bit-identical, because the
 summation order never changed, and that claim is checkable rather than
 rhetorical, since training is deterministic. Across all 300 steps, every
-training loss, validation loss and gradient norm matches the pre-optimisation
-run exactly:
+training loss, validation loss and gradient norm matches:
 
 ```
-step     1   train 4.6442   val 4.3820   |grad| 4.510      before and after
-step   150   train 2.2869   val 2.8396   |grad| 1.685      before and after
-step   300   train 2.0048   val 2.7374   |grad| 1.505      before and after
+step     1   train 4.6485   val 4.3087   |grad| 4.594      naive and blocked
+step   150   train 2.2816   val 2.5133   |grad| 1.160      naive and blocked
+step   300   train 1.9841   val 2.3109   |grad| 1.311      naive and blocked
 ```
 
-An optimisation that quietly altered the arithmetic would move that curve.
+So does the sampled text, byte for byte, which is the stronger statement of the
+two. A loss is one number per step and could match by coincidence in the digits
+printed; 200 characters drawn from the model's own distribution match only if
+every weight does. An optimisation that quietly altered the arithmetic would
+move both.
 
 **What was actually slow.** Not the arithmetic. The naive loop walks the whole
 weight matrix once per row, and the qkv projection's weights are 110 KB against
@@ -134,7 +178,7 @@ blocked for the array it writes, which changes no summation order either: `dx`
 still accumulates over outputs ascending, `dW` and `db` over rows ascending,
 exactly as when the loops were nested.
 
-**What did not help.** `-march=native` was *slower* (2,456), and gcc 6.3.0 on
+**What did not help.** `-march=native` was *slower* (2,520 against 2,574), and gcc 6.3.0 on
 this 32-bit toolchain does not vectorise the inner loop usefully. It would also
 have enabled FMA, which fuses a multiply and add into one rounding step and so
 would have changed results, losing the bit-identical property for a slowdown.
@@ -210,6 +254,15 @@ tests, which looks identical to being caught and is not. Terms are multiplied
 by zero instead, and anything that fails to compile is reported as inconclusive
 rather than counted as a pass. One mutation was scored that way on the first run
 and had to be rewritten.
+
+A pattern that matches the source in more than one place is reported the same
+way. This is not hypothetical: `src/ops.c` now carries the pre-optimisation
+matmul behind `-DGPTC_NAIVE_MATMUL`, and one mutation's target line appears
+identically in both copies. The harness patches the first match, which was the
+copy the default build does not compile, so the binary was unchanged, the suite
+passed, and the report blamed the tests for a gap that did not exist. A survivor
+that is really a mis-aimed patch is worse than no result at all, so an ambiguous
+pattern now refuses to run.
 
 The LayerNorm ones matter most. Its backward pass has two terms that exist only
 because the mean and variance are themselves functions of every element in the
@@ -382,9 +435,17 @@ data/       generated oracle dumps, not committed
 Requires a C99 compiler, `make`, and Python 3 with PyTorch for the oracle.
 
 ```
-make oracle     # regenerate data/*.bin from ref/*.py
-make test       # 10 tests
+make oracle        # regenerate data/*.bin from ref/*.py
+make test          # 25 tests against the oracle
+make train         # 500 steps on the repository's own source
+make mutate        # break the library 38 ways, check the tests notice
+make bench-matmul  # the blocked matmul against the one it replaced
 ```
+
+`make bench-matmul` builds both implementations from the same tree and runs them
+on the same corpus, which is what makes the throughput and the bit-identical
+losses reported above reproducible rather than remembered. `STEPS=300` for the
+long run.
 
 The oracle dumps are generated rather than committed, since they are derived from
 `ref/*.py`, and a binary blob in the history is something nobody can review.

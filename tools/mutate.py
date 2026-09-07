@@ -67,9 +67,16 @@ MUTATIONS = [
      "float e = expf(xr[c] - 0.0f * maximum);"),
 
     # ---- Linear ---------------------------------------------------------
+    # Anchored on the blocked version's own index expression. The bare
+    # accumulation line is identical in the naive implementation above it, and
+    # that copy is not in the build.
     ("src/ops.c", "linear backward: transpose the weight gradient",
-     "dwo[i] += g * xr[i];",
-     "dwo[i] += g * xr[in_features - 1 - i];"),
+     "float *dwo = dweight + (size_t)(o0 + b) * in_features;\n"
+     "                    for (int i = 0; i < in_features; ++i) {\n"
+     "                        dwo[i] += g * xr[i];",
+     "float *dwo = dweight + (size_t)(o0 + b) * in_features;\n"
+     "                    for (int i = 0; i < in_features; ++i) {\n"
+     "                        dwo[i] += g * xr[in_features - 1 - i];"),
     ("src/ops.c", "linear backward: forget the bias gradient",
      "dbias[o] += doutr[o];",
      "dbias[o] += 0.0f * doutr[o];"),
@@ -212,6 +219,21 @@ def main():
 
             if old not in text:
                 print(f"  PATTERN MISSING  {why}")
+                inconclusive += 1
+                continue
+
+            # A pattern that matches more than once is not a mutation, it is a
+            # coin flip. replace(..., 1) takes the first hit, and the first hit
+            # may sit in code this build does not compile: src/ops.c carries the
+            # pre-optimisation matmul behind -DGPTC_NAIVE_MATMUL, and a mutation
+            # landing there leaves the binary untouched. The suite then passes,
+            # the mutation is recorded as having survived, and the report blames
+            # the tests for a gap that does not exist. Refusing to guess is the
+            # only safe reading, so this counts as inconclusive rather than
+            # caught or survived.
+            hits = text.count(old)
+            if hits != 1:
+                print(f"  AMBIGUOUS ({hits})     {why}")
                 inconclusive += 1
                 continue
 

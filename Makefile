@@ -21,7 +21,7 @@ TESTS = tests/main.c tests/oracle.c tests/test_ops.c tests/test_model.c tests/te
 
 PYTHON ?= python
 
-.PHONY: all test oracle train mutate clean
+.PHONY: all test oracle train bench-matmul mutate clean
 
 all: test
 
@@ -46,14 +46,44 @@ train: build/train data/input.txt
 build/train: $(SRC) train.c | build
 	$(CC) $(CFLAGS) $(SRC) train.c -o $@ $(LDFLAGS)
 
-# The corpus is the project's own source and prose, concatenated. Using the repo
-# itself keeps the training data reproducible and the build free of downloads,
-# and a character model has plenty to learn from C syntax: matched braces,
+# The corpus is the project's own source, concatenated. Using the repo itself
+# keeps the training data reproducible and the build free of downloads, and a
+# character model has plenty to learn from C syntax: matched braces,
 # indentation, comment delimiters, identifier conventions.
-data/input.txt: $(wildcard src/*.c src/*.h tests/*.c ref/*.py) README.md
+#
+# README.md is deliberately not in it, though it was. That made the corpus
+# depend on the document that reports the training results, so correcting a loss
+# figure in the README changed the training data, which changed the loss figure.
+# A few pages of prose are not worth a fixed point that never settles.
+#
+# One list, used for both the prerequisites and the recipe. Writing them out
+# twice had already gone wrong: tests/*.h and train.c were concatenated but not
+# depended on, so editing either left a stale corpus behind and the next run
+# trained on the previous revision. $(sort) also pins the order, so the bytes do
+# not depend on how the shell happens to expand a glob.
+CORPUS = $(sort $(wildcard src/*.c src/*.h tests/*.c tests/*.h ref/*.py) train.c)
+
+data/input.txt: $(CORPUS)
 	mkdir -p data
-	cat src/*.c src/*.h tests/*.c tests/*.h ref/*.py train.c README.md > $@
+	cat $(CORPUS) > $@
 	@wc -c < $@ | xargs echo "  corpus bytes:"
+
+# Builds the trainer twice, with the matmul that came first and with the blocked
+# one that replaced it, and runs both over the same corpus. Two numbers come out
+# of it: the throughput, which should differ, and the loss curve, which should
+# not differ at all. The second is the harder claim and the reason the naive
+# loops are still in the tree rather than only in the history.
+STEPS ?= 30
+
+bench-matmul: data/input.txt | build
+	$(CC) $(CFLAGS) -DGPTC_NAIVE_MATMUL $(SRC) train.c -o build/train_naive $(LDFLAGS)
+	$(CC) $(CFLAGS) $(SRC) train.c -o build/train_blocked $(LDFLAGS)
+	@echo ""
+	@echo "=== naive triple loop ==="
+	./build/train_naive data/input.txt $(STEPS)
+	@echo ""
+	@echo "=== blocked ==="
+	./build/train_blocked data/input.txt $(STEPS)
 
 # Breaks the library on purpose, one bug at a time, and checks the suite
 # notices. A passing suite is evidence about the tests only if they can fail.

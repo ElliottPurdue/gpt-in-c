@@ -157,6 +157,30 @@ static unsigned char *read_file(const char *path, size_t *length)
     return buffer;
 }
 
+/* A 32-bit FNV-1a over the corpus bytes, printed with the run.
+ *
+ * The corpus is generated from the repository's own sources, so it changes
+ * whenever the code does, and a loss curve is only comparable against another
+ * curve trained on the same bytes. Size and vocabulary alone do not settle
+ * that: an edit adding one character and removing another leaves both
+ * unchanged. Printing a fingerprint lets any two runs be compared without
+ * having to trust that the tree was identical, which is what the claim about
+ * the blocked matmul leaving the arithmetic alone actually rests on. */
+static unsigned long corpus_fingerprint(const unsigned char *data, size_t length)
+{
+    unsigned long hash = 2166136261UL;
+    for (size_t i = 0; i < length; ++i) {
+        hash ^= (unsigned long)data[i];
+        /* The FNV prime, 16777619, as shifts. The mask keeps the result to 32
+         * bits on toolchains where unsigned long is wider than that, so the
+         * fingerprint is the same number everywhere. */
+        hash = (hash + (hash << 1) + (hash << 4) + (hash << 7) +
+                (hash << 8) + (hash << 24)) & 0xffffffffUL;
+    }
+    return hash;
+}
+
+
 /* Draws a batch of (input, target) windows. The target is the input shifted one
  * position, so every position in the sequence supplies a prediction rather than
  * only the last -- which is what makes a single forward pass worth B*T training
@@ -231,6 +255,10 @@ int main(int argc, char **argv)
 
     int *tokens = (int *)malloc(file_length * sizeof(int));
     size_t token_count = tokenizer_encode(&tok, text, file_length, tokens);
+
+    /* Taken here rather than beside the printf that reports it, which runs
+     * after this free. */
+    unsigned long corpus_hash = corpus_fingerprint(text, file_length);
     free(text);
 
     /* Contiguous split, last 10% held out. */
@@ -267,6 +295,7 @@ int main(int argc, char **argv)
     printf("\ngpt-in-c\n");
     printf("  corpus      %s, %zu bytes, %d distinct characters\n",
            path, file_length, tok.vocab_size);
+    printf("  fingerprint %08lx\n", corpus_hash);
     printf("  split       %zu train / %zu validation tokens\n",
            train_count, val_count);
     printf("  model       %d layers, %d heads, width %d, context %d\n",

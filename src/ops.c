@@ -7,6 +7,82 @@
  * Linear
  * ------------------------------------------------------------------------ */
 
+#ifdef GPTC_NAIVE_MATMUL
+
+/* The version that came first, copied back verbatim from the commit before the
+ * blocking and kept behind a flag.
+ *
+ * Two things are claimed about the blocked matmul below: that it is faster, and
+ * that it computes bit-identical results. Both are claims about a comparison,
+ * and a comparison needs both sides present. With this side living only in git
+ * history the numbers could not be reproduced without archaeology, and a
+ * paraphrase would not do either, since the thing being measured is exactly how
+ * these loops are written. `make bench-matmul` builds both and runs them on the
+ * same corpus.
+ *
+ * Every accumulation here runs in the order the blocked version preserves: sum
+ * over i ascending, dx over o ascending, dweight and dbias over r ascending.
+ * That is the property under test. Reordering these loops would move the losses
+ * in the last bits and the comparison would prove nothing. */
+void linear_forward(float *out, const float *x, const float *weight,
+                    const float *bias, int rows, int in_features,
+                    int out_features)
+{
+    for (int r = 0; r < rows; ++r) {
+        const float *xr = x + (size_t)r * in_features;
+        float *outr = out + (size_t)r * out_features;
+
+        for (int o = 0; o < out_features; ++o) {
+            const float *wo = weight + (size_t)o * in_features;
+            float sum = bias ? bias[o] : 0.0f;
+            for (int i = 0; i < in_features; ++i) {
+                sum += xr[i] * wo[i];
+            }
+            outr[o] = sum;
+        }
+    }
+}
+
+void linear_backward(float *dx, float *dweight, float *dbias,
+                     const float *dout, const float *x, const float *weight,
+                     int rows, int in_features, int out_features)
+{
+    /* y[r][o] = sum_i x[r][i] * W[o][i] + b[o], so
+     *     dx[r][i] = sum_o dy[r][o] * W[o][i]
+     *     dW[o][i] = sum_r dy[r][o] * x[r][i]
+     *     db[o]    = sum_r dy[r][o]
+     *
+     * The two loops are separated by which output they write, not by which
+     * input they read, so neither needs a temporary. */
+    for (int r = 0; r < rows; ++r) {
+        const float *doutr = dout + (size_t)r * out_features;
+        const float *xr = x + (size_t)r * in_features;
+        float *dxr = dx ? dx + (size_t)r * in_features : NULL;
+
+        for (int o = 0; o < out_features; ++o) {
+            float g = doutr[o];
+            const float *wo = weight + (size_t)o * in_features;
+
+            if (dxr) {
+                for (int i = 0; i < in_features; ++i) {
+                    dxr[i] += g * wo[i];
+                }
+            }
+            if (dweight) {
+                float *dwo = dweight + (size_t)o * in_features;
+                for (int i = 0; i < in_features; ++i) {
+                    dwo[i] += g * xr[i];
+                }
+            }
+            if (dbias) {
+                dbias[o] += g;
+            }
+        }
+    }
+}
+
+#else
+
 /* Rows are processed in blocks so that each row of the weight matrix is loaded
  * once per block instead of once per row.
  *
@@ -124,6 +200,8 @@ void linear_backward(float *dx, float *dweight, float *dbias,
         }
     }
 }
+
+#endif /* GPTC_NAIVE_MATMUL */
 
 /* ------------------------------------------------------------------------
  * LayerNorm

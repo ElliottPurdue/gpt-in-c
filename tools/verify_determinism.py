@@ -45,13 +45,34 @@ THREAD_COUNTS = ["1", "2", "3", "4", "7", "16", "33"]
 
 # A run that silently fell back to serial would agree with every other run for
 # the wrong reason, so the reported count is checked against the requested one.
-THREADS_LINE = re.compile(r"^\s*threads\s+(\d+)\s*$", re.MULTILINE)
+THREADS_LINE = re.compile(r"^\s*threads\s+(\d+)\s*$")
 
-# Throughput is the one thing that is expected to differ, so it is stripped
-# before comparison rather than being allowed to fail the diff. Everything else
-# on those lines, the losses and the gradient norms, is compared exactly.
-TOKENS_PER_SEC = re.compile(r"\s*\d+ tok/s")
-WALL_TIME = re.compile(r"^\s*\d+ steps in [\d.]+ s, \d+ tokens/s\s*$", re.MULTILINE)
+# Throughput is the one thing expected to differ, so it is removed before the
+# comparison rather than being allowed to fail it. Everything else on those
+# lines, the losses and the gradient norms, is compared exactly.
+#
+# Line-based rather than a regex over the whole text, deliberately. Doing this
+# with re.sub and a MULTILINE `$` deletes the content of a line and leaves its
+# newline, so dropping the threads line, which only the threaded build prints,
+# left a blank line in its place and every thread count "differed" from serial
+# by exactly one empty line. The check failed on its first CI run for that
+# reason and nothing else, which is a good argument for building a gate that can
+# fail and then watching what it does when it fails.
+PER_STEP_RATE = re.compile(r"\s*\d+ tok/s\s*$")
+WALL_TIME = re.compile(r"^\s*\d+ steps in [\d.]+ s, \d+ tokens/s\s*$")
+
+
+def normalise(text):
+    """Strip everything that is allowed to differ between two correct runs."""
+    kept = []
+    for line in text.splitlines():
+        if THREADS_LINE.match(line):
+            continue          # printed by the threaded build only
+        if WALL_TIME.match(line):
+            kept.append("  (timing removed)")
+            continue
+        kept.append(PER_STEP_RATE.sub("", line))
+    return "\n".join(kept)
 
 
 def run(binary, threads=None):
@@ -81,19 +102,14 @@ def run(binary, threads=None):
             % (binary.name, proc.returncode, proc.stdout[-2000:], proc.stderr[-2000:])
         )
 
-    text = proc.stdout
     reported = None
-    match = THREADS_LINE.search(text)
-    if match:
-        reported = match.group(1)
+    for line in proc.stdout.splitlines():
+        match = THREADS_LINE.match(line)
+        if match:
+            reported = match.group(1)
+            break
 
-    # Drop the lines and fields that are allowed to differ.
-    text = TOKENS_PER_SEC.sub("", text)
-    text = WALL_TIME.sub("  (timing removed)", text)
-    # The serial build prints no threads line and the threaded one does, so it
-    # cannot take part in a byte comparison between the two.
-    text = THREADS_LINE.sub("", text)
-    return text, reported
+    return normalise(proc.stdout), reported
 
 
 def main():

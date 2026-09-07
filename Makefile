@@ -63,9 +63,16 @@ build/train: $(SRC) train.c | build
 # not depend on how the shell happens to expand a glob.
 CORPUS = $(sort $(wildcard src/*.c src/*.h tests/*.c tests/*.h ref/*.py) train.c)
 
+# tr strips carriage returns, which is not cosmetic. This tree is checked out on
+# Windows with CRLF endings and on the Linux CI runner with LF, so the raw
+# concatenation differs by one byte per line: 145,065 bytes and 95 distinct
+# characters there against 147,047 and 96 here, a different vocabulary and a
+# different loss curve from the same commit. The fingerprint caught it on its
+# first CI run. Normalising here rather than through .gitattributes means the
+# corpus does not depend on anyone's core.autocrlf.
 data/input.txt: $(CORPUS)
 	mkdir -p data
-	cat $(CORPUS) > $@
+	cat $(CORPUS) | tr -d '\r' > $@
 	@wc -c < $@ | xargs echo "  corpus bytes:"
 
 # Builds the trainer twice, with the matmul that came first and with the blocked

@@ -38,26 +38,26 @@ Early. Working so far:
 The full model agrees with PyTorch on the loss, the logits, and **every one of
 its 30,144 parameter gradients**, to 2e-5 absolute or 2e-4 relative.
 
-**It trains.** On the repository's own source as a corpus (147,047 bytes, 96
-distinct characters), a 3-layer, width-96, context-64 model of 360,288
+**It trains.** On the repository's own source as a corpus (145,065 bytes, 95
+distinct characters), a 3-layer, width-96, context-64 model of 360,096
 parameters:
 
 ```
-  corpus      data/input.txt, 147047 bytes, 96 distinct characters
-  fingerprint cf70ccf2
-  split       132342 train / 14705 validation tokens
+  corpus      data/input.txt, 145065 bytes, 95 distinct characters
+  fingerprint bc6b6b1c
+  split       130558 train / 14507 validation tokens
 
-  expected initial loss  4.5643  (ln 96)
+  expected initial loss  4.5539  (ln 95)
 
-  step     1   train 4.6485   val 4.3087   |grad| 4.594
-  step    50   train 2.9242   val 2.7815   |grad| 1.272
-  step   100   train 2.5672   val 2.6521   |grad| 1.996
-  step   150   train 2.2816   val 2.5133   |grad| 1.160
-  step   200   train 2.4965   val 2.4895   |grad| 1.329
-  step   250   train 2.3650   val 2.4090   |grad| 1.204
-  step   300   train 1.9841   val 2.3109   |grad| 1.311
+  step     1   train 4.5503   val 4.3213   |grad| 6.371
+  step    50   train 2.8666   val 2.8382   |grad| 1.121
+  step   100   train 2.5759   val 2.6386   |grad| 0.975
+  step   150   train 2.3573   val 2.5229   |grad| 1.092
+  step   200   train 2.1608   val 2.4325   |grad| 1.203
+  step   250   train 2.1109   val 2.3868   |grad| 1.320
+  step   300   train 2.0701   val 2.3259   |grad| 1.418
 
-  300 steps in 130.7 s, 2577 tokens/s
+  300 steps in 129.9 s, 2592 tokens/s
 ```
 
 The corpus is built from the repository's source files by `make data/input.txt`,
@@ -66,38 +66,60 @@ be shown to have seen the same bytes rather than assumed to have. Size and
 vocabulary alone will not do it: an edit that adds one character and removes
 another leaves both unchanged.
 
+It earned its place immediately. The first CI run with it printed 145,065 bytes
+and 95 distinct characters against 147,047 and 96 here, from the same commit.
+The tree checks out CRLF on Windows and LF on the Linux runner, so the corpus
+carried one extra byte per line and one extra vocabulary entry, and every figure
+below was reproducible only on the machine that produced it. The rule strips
+carriage returns now.
+
+With that fixed, the run reproduces across the two exactly:
+
+```
+                     32-bit MinGW 6.3, Windows     GCC 13 x86-64, Linux
+  fingerprint        bc6b6b1c                      bc6b6b1c
+  step     1         4.5503  4.3213  6.371         4.5503  4.3213  6.371
+  step    20         3.4062  3.2578  1.019         3.4062  3.2578  1.019
+  throughput         2,592 tokens/s                3,547 tokens/s
+```
+
+Same digits on two architectures under compilers seven major versions apart,
+with only the speed differing. That is what `-msse2 -mfpmath=sse` in the Makefile
+buys: pinning the host build to a true 32-bit FPU instead of letting x87
+evaluate at 80 bits is the difference between a curve that reproduces elsewhere
+and one that does not.
+
 Sampling at temperature 0.8 after those 300 steps:
 
 ```
-"_p.loche coutpe, warss ale catse                           rerendor twor ims,
-delt ithemevos titeched cliny ameon t aly sid taten ind ameddimig lontered ats
-ay f = ("lecocesize_t_contendeng ais;
+"biclod);   ist_counsthe apam, ti(sig, bleate, care(dicledust_reint_blyeaclens
+= 0l, ngearwoudint = T, 0;  te      de->watn_enbward(f0] * 1;
+t          C * T_float *voif(pl *= c.d(&gi
 ```
 
-Gibberish, but structured gibberish, and the structure is the evidence. It
-spells `size_t` correctly in the middle of an invented identifier, which is the
-longest real token in the sample and not a short one to reach by accident. It
-opens on a quote, closes a statement with `;`, produces the `= (` shape that
-begins an assignment from a call or a cast, joins words with underscores the way
-the identifiers it trained on do, keeps a comma-separated rhythm, and reproduces
-the long indentation runs. Nothing above the character and short-token level,
-which is what 300 steps on a 360K-parameter model buys.
+Gibberish, but structured gibberish, and the structure is the evidence. It emits
+`->` and `*=` as units, which are two characters that only ever appear together
+in the source and never as a stray `-` or `=`. It closes a call with `);`,
+terminates a statement with `= 0;`, opens an argument list with `(&` in the shape
+of an address-of, spells `float` inside an invented type name, and reproduces
+`C * T`, which appears verbatim in the code as a size expression. Nothing above
+the character and short-token level, which is what 300 steps on a 360K-parameter
+model buys.
 
-For scale, 2.31 nats is about 3.33 bits per character; a well-trained character
+For scale, 2.33 nats is about 3.36 bits per character; a well-trained character
 model on English runs nearer 1 to 1.5. Both curves were still falling when the
 run stopped.
 
-The first loss lands within 0.084 of `ln(vocab_size)`, and above it: 4.6485
-against 4.5643. Above is the only direction available, since a randomly
+The first loss lands within 0.004 of `ln(vocab_size)`: 4.5503 against 4.5539. Above is the only direction available, since a randomly
 initialised model is not exactly uniform and any departure from uniform costs
 cross-entropy. Printing the expected value next to it turns the first step into
 a check on the initialisation rather than an unanchored number, and the check is
 worth having: a starting loss near zero means the targets have leaked into the
 inputs, and one several times larger means the initialisation scale is wrong.
 
-By step 300 training loss has pulled ahead of validation, 1.98 against 2.31. The
+By step 300 training loss has pulled ahead of validation, 2.07 against 2.33. The
 gap is real but small, which is the expected shape for 360K parameters against
-132K training tokens: enough capacity to begin memorising, not enough steps to
+131K training tokens: enough capacity to begin memorising, not enough steps to
 have done much of it yet.
 
 An earlier version of this corpus included README.md, and reported a far wider
@@ -110,10 +132,10 @@ README from the corpus removed both that confound and a worse one: the file
 reporting these numbers was part of the data producing them, so correcting a
 figure here changed the run it described.
 
-### The 32-bit toolchain is costing about 1.8x
+### The 32-bit toolchain is costing about 1.4x
 
-CI reports **CI_TOKENS tokens/s** on a GitHub runner against **2,577** on the
-development machine, on identical code. The runner is x86-64 with GCC 13; the
+CI reports **3,547 tokens/s** on a GitHub runner against **2,592** on the
+development machine, on identical code and, as above, an identical loss curve. The runner is x86-64 with GCC 13; the
 local build is 32-bit MinGW 6.3, which has half the registers, an older
 optimiser, and no pthread -- which is also why OpenMP is unavailable here. The
 matmul work below is measured on the slower of the two, so the figures are
@@ -122,7 +144,7 @@ conservative rather than flattering.
 ### Making it faster, and proving it still computes the same thing
 
 The matmul was the entire cost. Restructuring it is worth **1.12x** on the full
-300-step run: 2,296 to 2,577 tokens/s, 148.4 s down to 130.7 s.
+300-step run: 2,314 to 2,592 tokens/s, 147.3 s down to 129.9 s.
 
 The version it replaced is still in the tree, behind `-DGPTC_NAIVE_MATMUL`,
 copied back verbatim from the commit before the change. `make bench-matmul`
@@ -136,10 +158,10 @@ Shorter 30-step runs, used to compare build flags:
 
 | build | tokens/s | training loss at step 30 |
 |---|---|---|
-| naive triple loop, `-O2` | 1,761 | 3.0183 |
-| blocked, `-O2` | 1,828 | 3.0183 |
-| naive triple loop, `-O3` | 2,247 | 3.0183 |
-| blocked, `-O3` | **2,574** | 3.0183 |
+| naive triple loop, `-O2` | 1,771 | 3.0469 |
+| blocked, `-O2` | 1,869 | 3.0469 |
+| naive triple loop, `-O3` | 2,302 | 3.0469 |
+| blocked, `-O3` | **2,596** | 3.0469 |
 
 (Short runs measure high or low by 5-10% depending on warm-up, which is why the
 headline figure comes from the 300-step runs rather than this table.)
@@ -158,9 +180,9 @@ rhetorical, since training is deterministic. Across all 300 steps, every
 training loss, validation loss and gradient norm matches:
 
 ```
-step     1   train 4.6485   val 4.3087   |grad| 4.594      naive and blocked
-step   150   train 2.2816   val 2.5133   |grad| 1.160      naive and blocked
-step   300   train 1.9841   val 2.3109   |grad| 1.311      naive and blocked
+step     1   train 4.5503   val 4.3213   |grad| 6.371      naive and blocked
+step   150   train 2.3573   val 2.5229   |grad| 1.092      naive and blocked
+step   300   train 2.0701   val 2.3259   |grad| 1.418      naive and blocked
 ```
 
 So does the sampled text, byte for byte, which is the stronger statement of the
@@ -178,7 +200,7 @@ blocked for the array it writes, which changes no summation order either: `dx`
 still accumulates over outputs ascending, `dW` and `db` over rows ascending,
 exactly as when the loops were nested.
 
-**What did not help.** `-march=native` was *slower* (2,520 against 2,574), and gcc 6.3.0 on
+**What did not help.** `-march=native` was *slower* (2,539 against 2,596), and gcc 6.3.0 on
 this 32-bit toolchain does not vectorise the inner loop usefully. It would also
 have enabled FMA, which fuses a multiply and add into one rounding step and so
 would have changed results, losing the bit-identical property for a slowdown.
